@@ -1,0 +1,24 @@
+# File System
+.DS_Store
+
+# Python Cache
+__pycache__/
+
+# Training Data
+training/data/cv
+training/data/embedding
+training/data/raw
+training/oof
+
+# Inference Data
+data/blast/*
+!data/blast/.gitkeep
+data/embedding/*
+!data/embedding/.gitkeep
+
+# Models
+models/
+
+# Predictions
+predictions/*
+!predictions/.gitkeep
