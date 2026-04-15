@@ -23,5 +23,6 @@ python training/late_fusion.py
 ## batch-size: 2
 ## method: fusion  (esm2/cnn/blast/t5)
 ## obo: data/gobsic.obo
+## cpu: 8
 python predict.py 
 ```

@@ -38,7 +38,7 @@ def _build_database(train_fasta: Path, db_dir: Path) -> Path:
     return db_prefix
 
 
-def _run_blast(query_fasta: Path, db_prefix: Path, output_path: Path, max_hits: int, evalue: float) -> None:
+def _run_blast(query_fasta: Path, db_prefix: Path, output_path: Path, max_hits: int, evalue: float, num_threads: int = 8) -> None:
     command = [
         "blastp",
         "-query",
@@ -50,7 +50,7 @@ def _run_blast(query_fasta: Path, db_prefix: Path, output_path: Path, max_hits: 
         "-max_target_seqs",
         str(max_hits),
         "-num_threads",
-        "8",
+        str(num_threads),
         "-evalue",
         str(evalue),
         "-out",

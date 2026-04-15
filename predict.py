@@ -131,6 +131,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--in", dest="input", default=ROOT_DIR / "data" / "test.fasta", type=Path)
     parser.add_argument("--out", dest="output", default=DEFAULT_OUTPUT_PATH, type=Path)
     parser.add_argument("--batchsize", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--cpu", type=int, default=8, help="Number of CPU cores for BLAST and dataloader tasks")
     parser.add_argument(
         "--obo",
         type=Path,
@@ -366,6 +367,7 @@ def predict_for_method(
     sequences_by_pid: Dict[str, str],
     batch_size: int,
     device: torch.device,
+    num_workers: int = 0,
 ) -> dict:
     checkpoint_info = load_checkpoint(models_dir, method, aspect, device)
     checkpoint_payload = checkpoint_info["payload"]
@@ -390,7 +392,7 @@ def predict_for_method(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=num_workers,
         collate_fn=collate_inference_batch,
     )
     predictions = run_model_inference(
@@ -450,12 +452,13 @@ def run_blast_inference(
     query_pids: np.ndarray,
     classes: np.ndarray,
     aspect: str,
+    num_threads: int = 8,
 ) -> np.ndarray:
     _require_blast()
     blast_dir = ROOT_DIR / "data" / "blast"
     db_prefix = _build_database(blast_dir / "blast.fasta", blast_dir / "cache")
     output_path = blast_dir / "cache" / "query_vs_blast.tsv"
-    _run_blast(query_fasta, db_prefix, output_path, max_hits=10, evalue=1e-3)
+    _run_blast(query_fasta, db_prefix, output_path, max_hits=10, evalue=1e-3, num_threads=num_threads)
     hits = _parse_blast_hits(output_path)
     labels_df = pd.read_csv(blast_dir / "blast.tsv", sep="\t")
     return _transfer_scores(query_pids, hits, labels_df, classes, aspect=aspect)
@@ -529,6 +532,7 @@ def main() -> None:
                 query_pids=query_pids,
                 classes=classes,
                 aspect=aspect,
+                num_threads=args.cpu,
             )
             if go_parents is not None:
                 blast_scores = apply_go_propagation(blast_scores, classes, go_parents)
@@ -566,6 +570,7 @@ def main() -> None:
                     sequences_by_pid=sequences_by_pid,
                     batch_size=args.batchsize,
                     device=device,
+                    num_workers=args.cpu,
                 )
                 if go_parents is not None:
                     result["probs"] = apply_go_propagation(
@@ -592,6 +597,7 @@ def main() -> None:
                     sequences_by_pid=sequences_by_pid,
                     batch_size=args.batchsize,
                     device=device,
+                    num_workers=args.cpu,
                 )
                 for method in ("esm2", "t5", "cnn")
             }
@@ -620,6 +626,7 @@ def main() -> None:
                     query_pids=reference_pids,
                     classes=fusion_classes,
                     aspect=aspect,
+                    num_threads=args.cpu,
                 )
                 fused_probs += blast_weight * blast_scores
                 total_weight += blast_weight
