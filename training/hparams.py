@@ -9,7 +9,7 @@ COMMON_TRAINING_CONFIG: Dict[str, object] = {
     "epochs": 20,
     "batch_size": 16,
     "weight_decay": 2e-4,
-    "num_workers": 0,
+    "num_workers": 4,
     "threshold": 0.5,
     "save_fold_artifacts": False,
     "device": "auto",

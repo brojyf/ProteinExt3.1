@@ -210,7 +210,9 @@ def compute_multilabel_metrics(
             "fmax_threshold": threshold,
         }
 
-    y_pred = (y_prob >= threshold).astype(np.int32)
+    y_pred = y_prob >= threshold
+    y_true_bool = y_true.astype(bool)
+    
     best_f1 = 0.0
     best_threshold = threshold
     thresholds = np.linspace(0.01, 0.99, 99)
@@ -221,16 +223,30 @@ def compute_multilabel_metrics(
         dynamic_ncols=True,
     )
     for candidate in progress:
-        candidate_pred = (y_prob >= candidate).astype(np.int32)
-        candidate_f1 = float(f1_score(y_true, candidate_pred, average="micro", zero_division=0))
+        candidate_pred = y_prob >= candidate
+        tp = np.logical_and(candidate_pred, y_true_bool).sum()
+        fp = np.logical_and(candidate_pred, ~y_true_bool).sum()
+        fn = np.logical_and(~candidate_pred, y_true_bool).sum()
+        
+        denom = 2 * tp + fp + fn
+        candidate_f1 = float((2 * tp) / denom) if denom > 0 else 0.0
+        
         if candidate_f1 > best_f1:
             best_f1 = candidate_f1
             best_threshold = float(candidate)
 
+    tp_base = np.logical_and(y_pred, y_true_bool).sum()
+    fp_base = np.logical_and(y_pred, ~y_true_bool).sum()
+    fn_base = np.logical_and(~y_pred, y_true_bool).sum()
+
+    denom_f1 = 2 * tp_base + fp_base + fn_base
+    denom_p = tp_base + fp_base
+    denom_r = tp_base + fn_base
+
     return {
-        "micro_f1": float(f1_score(y_true, y_pred, average="micro", zero_division=0)),
-        "micro_precision": float(precision_score(y_true, y_pred, average="micro", zero_division=0)),
-        "micro_recall": float(recall_score(y_true, y_pred, average="micro", zero_division=0)),
+        "micro_f1": float((2 * tp_base) / denom_f1) if denom_f1 > 0 else 0.0,
+        "micro_precision": float(tp_base / denom_p) if denom_p > 0 else 0.0,
+        "micro_recall": float(tp_base / denom_r) if denom_r > 0 else 0.0,
         "fmax": best_f1,
         "fmax_threshold": best_threshold,
     }

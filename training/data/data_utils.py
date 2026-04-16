@@ -176,12 +176,11 @@ def build_token_hydrophobicity_features(sequence: str, token_length: int, window
 
     half_window = max(window_size // 2, 1)
     local = np.zeros((values.shape[0], 2), dtype=np.float32)
-    for residue_index in range(values.shape[0]):
-        start = max(0, residue_index - half_window)
-        end = min(values.shape[0], residue_index + half_window + 1)
-        chunk = values[start:end]
-        local[residue_index, 0] = float(chunk.mean())
-        local[residue_index, 1] = float(chunk.var())
+    
+    window = half_window * 2 + 1
+    rolled = pd.Series(values).rolling(window=window, min_periods=1, center=True)
+    local[:, 0] = rolled.mean().to_numpy()
+    local[:, 1] = rolled.var(ddof=0).fillna(0.0).to_numpy()
 
     usable_length = min(local.shape[0], max(token_length - 2, 0))
     if usable_length > 0:

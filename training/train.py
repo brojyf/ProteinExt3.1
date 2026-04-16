@@ -141,6 +141,9 @@ def build_loaders(args: SimpleNamespace, fold_data):
         shuffle=True,
         num_workers=args.num_workers,
         collate_fn=collate_token_embedding_batch,
+        pin_memory=(args.device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -148,6 +151,9 @@ def build_loaders(args: SimpleNamespace, fold_data):
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=collate_token_embedding_batch,
+        pin_memory=(args.device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
     return train_loader, val_loader
 
