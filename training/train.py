@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--method", choices=["cnn", "esm2", "t5", "blast"])
     parser.add_argument("--aspect", choices=["P", "F", "C"])
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu", "mps"], help="Force specific device")
     parser.add_argument("--batch-size", dest="batch_size", type=int)
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--fold", type=int, nargs="+")
@@ -90,7 +91,7 @@ def namespace_from_config(config: dict) -> SimpleNamespace:
 
 def apply_cli_overrides(run_config: dict, cli_args: argparse.Namespace) -> dict:
     resolved = dict(run_config)
-    for key in ("method", "aspect", "batch_size", "epochs", "fold"):
+    for key in ("method", "aspect", "batch_size", "epochs", "fold", "device"):
         value = getattr(cli_args, key, None)
         if value is not None:
             resolved[key] = value
