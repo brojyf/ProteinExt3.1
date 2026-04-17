@@ -95,7 +95,6 @@ def normalize_prott5_sequence(sequence: str) -> str:
 
 
 def save_embedding_tensor(path: Path, tensor: torch.Tensor) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(tensor.detach().cpu().to(torch.float16), path)
 
 
@@ -107,7 +106,7 @@ def print_embedding_device_summary(device: torch.device) -> None:
     print(f"Embedding extraction device: {device.type}")
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def extract_esm2_embeddings(
     *,
     sequences_by_pid: Dict[str, str],
@@ -123,6 +122,9 @@ def extract_esm2_embeddings(
     tokenizer = AutoTokenizer.from_pretrained(pretrained_name)
     model = EsmModel.from_pretrained(pretrained_name, add_pooling_layer=False).to(device)
     model.eval()
+    
+    (output_dir / "esm2" / "last").mkdir(parents=True, exist_ok=True)
+    (output_dir / "esm2" / esm2_layer_dir(layer_index)).mkdir(parents=True, exist_ok=True)
 
     pids = sorted(sequences_by_pid)
     progress = tqdm(range(0, len(pids), batch_size), desc="Extracting ESM2 embeddings", dynamic_ncols=True)
@@ -137,7 +139,8 @@ def extract_esm2_embeddings(
             return_tensors="pt",
         )
         tokens = {key: value.to(device) for key, value in tokens.items()}
-        outputs = model(**tokens, output_hidden_states=True)
+        with torch.amp.autocast(device.type):
+            outputs = model(**tokens, output_hidden_states=True)
 
         last_hidden = outputs.last_hidden_state
         layer_hidden = outputs.hidden_states[layer_index]
@@ -152,7 +155,7 @@ def extract_esm2_embeddings(
             )
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def extract_t5_embeddings(
     *,
     sequences_by_pid: Dict[str, str],
@@ -174,6 +177,8 @@ def extract_t5_embeddings(
         model = model.float()
     model.eval()
 
+    (output_dir / "t5" / "last").mkdir(parents=True, exist_ok=True)
+
     pids = sorted(sequences_by_pid)
     progress = tqdm(range(0, len(pids), batch_size), desc="Extracting ProtT5 embeddings", dynamic_ncols=True)
     for start in progress:
@@ -187,7 +192,8 @@ def extract_t5_embeddings(
             return_tensors="pt",
         )
         tokens = {key: value.to(device) for key, value in tokens.items()}
-        outputs = model(**tokens)
+        with torch.amp.autocast(device.type):
+            outputs = model(**tokens)
         hidden = outputs.last_hidden_state
         attention_mask = tokens["attention_mask"]
 
