@@ -35,7 +35,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--methods", nargs="+", default=DEFAULT_METHODS, choices=DEFAULT_METHODS)
     parser.add_argument("--fold", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     parser.add_argument("--oof-dir", type=Path, default=DEFAULT_OOF_DIR)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_DIR / "fusion_weights.csv",
+                        help="Exact file path to save the output CSV. A JSON summary will be saved alongside it.")
     parser.add_argument("--weight-step", type=float, default=0.1)
     parser.add_argument("--threshold-start", type=float, default=0.1)
     parser.add_argument("--threshold-stop", type=float, default=0.9)
@@ -232,7 +233,7 @@ def save_fused_oof(output_dir: Path, aspect: str, payload: dict, best: dict) -> 
 def main() -> None:
     args = parse_args()
     args.oof_dir = Path(args.oof_dir)
-    args.output_dir = Path(args.output_dir)
+    args.output = Path(args.output)
     thresholds = generate_thresholds(args.threshold_start, args.threshold_stop, args.threshold_step)
 
     obo_path = Path(args.obo)
@@ -284,13 +285,17 @@ def main() -> None:
             f"micro_f1={best['metrics']['micro_f1']:.4f}"
         )
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = args.output
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
     frame = pd.DataFrame(rows)
-    frame.to_csv(args.output_dir / "fusion_weights.csv", index=False)
-    with (args.output_dir / "late_fusion_summary.json").open("w", encoding="utf-8") as handle:
+    
+    json_path = csv_path.with_name(csv_path.stem + "_summary.json")
+    
+    frame.to_csv(csv_path, index=False)
+    with json_path.open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
 
-    print(f"\nSaved fusion weights to {args.output_dir / 'fusion_weights.csv'}")
+    print(f"\nSaved fusion weights to {csv_path}")
 
 
 if __name__ == "__main__":

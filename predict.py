@@ -301,7 +301,7 @@ def dataset_kwargs_for_method(method: str, args_ns: SimpleNamespace) -> dict:
     raise ValueError(f"Unsupported inference method: {method}")
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def run_model_inference(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -314,7 +314,8 @@ def run_model_inference(
 
     for pids, batch_inputs in DataLoaderProgress(loader, progress_desc):
         batch_inputs = move_batch_to_device(batch_inputs, device)
-        logits = model(batch_inputs)
+        with torch.amp.autocast(device.type):
+            logits = model(batch_inputs)
         probs = torch.sigmoid(logits).cpu().numpy()
         all_pids.extend(pids)
         all_probs.append(probs)

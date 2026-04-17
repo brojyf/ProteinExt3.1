@@ -15,6 +15,7 @@ data/blast/*
 !data/blast/.gitkeep
 data/embedding/*
 !data/embedding/.gitkeep
+data/test.fasta
 
 # Models
 models/

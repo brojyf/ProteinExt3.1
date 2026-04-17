@@ -11,7 +11,7 @@ python training/data/embedding.py --plm t5 --batch-size 1
 python training/train.py --method cnn/esm2/t5 --aspect P/F/C
 
 # late fusion weight
-python training/late_fusion.py
+python training/late_fusion.py --aspect P/F/C --methods esm2/cnn/blast/t5 --output path/to/.csv
 ```
 
 
@@ -24,5 +24,5 @@ python training/late_fusion.py
 ## method: fusion  (esm2/cnn/blast/t5)
 ## obo: data/gobsic.obo
 ## cpu: 8
-python predict.py 
+python predict.py
 ```
