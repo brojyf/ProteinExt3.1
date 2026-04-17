@@ -126,7 +126,16 @@ def extract_esm2_embeddings(
     (output_dir / "esm2" / "last").mkdir(parents=True, exist_ok=True)
     (output_dir / "esm2" / esm2_layer_dir(layer_index)).mkdir(parents=True, exist_ok=True)
 
-    pids = sorted(sequences_by_pid)
+    pids = []
+    for pid in sorted(sequences_by_pid):
+        last_path = output_dir / "esm2" / "last" / f"{pid}.pt"
+        layer_path = output_dir / "esm2" / esm2_layer_dir(layer_index) / f"{pid}.pt"
+        if not (last_path.exists() and layer_path.exists()):
+            pids.append(pid)
+            
+    if not pids:
+        print("All ESM2 embeddings already exist. Skipping.")
+        return
     progress = tqdm(range(0, len(pids), batch_size), desc="Extracting ESM2 embeddings", dynamic_ncols=True)
     for start in progress:
         batch_pids = pids[start : start + batch_size]
@@ -148,10 +157,10 @@ def extract_esm2_embeddings(
 
         for index, pid in enumerate(batch_pids):
             valid_length = int(attention_mask[index].sum().item())
-            save_embedding_tensor(output_dir / "esm2" / "last" / f"{pid}.pt", last_hidden[index, :valid_length])
+            save_embedding_tensor(output_dir / "esm2" / "last" / f"{pid}.pt", last_hidden[index, :valid_length].clone())
             save_embedding_tensor(
                 output_dir / "esm2" / esm2_layer_dir(layer_index) / f"{pid}.pt",
-                layer_hidden[index, :valid_length],
+                layer_hidden[index, :valid_length].clone(),
             )
 
 
@@ -179,7 +188,15 @@ def extract_t5_embeddings(
 
     (output_dir / "t5" / "last").mkdir(parents=True, exist_ok=True)
 
-    pids = sorted(sequences_by_pid)
+    pids = []
+    for pid in sorted(sequences_by_pid):
+        last_path = output_dir / "t5" / "last" / f"{pid}.pt"
+        if not last_path.exists():
+            pids.append(pid)
+            
+    if not pids:
+        print("All ProtT5 embeddings already exist. Skipping.")
+        return
     progress = tqdm(range(0, len(pids), batch_size), desc="Extracting ProtT5 embeddings", dynamic_ncols=True)
     for start in progress:
         batch_pids = pids[start : start + batch_size]
@@ -200,7 +217,7 @@ def extract_t5_embeddings(
 
         for index, pid in enumerate(batch_pids):
             valid_length = int(attention_mask[index].sum().item())
-            save_embedding_tensor(output_dir / "t5" / "last" / f"{pid}.pt", hidden[index, :valid_length])
+            save_embedding_tensor(output_dir / "t5" / "last" / f"{pid}.pt", hidden[index, :valid_length].clone())
 
 
 def run_embedding_extraction(args) -> None:
