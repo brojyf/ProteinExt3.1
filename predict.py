@@ -76,7 +76,7 @@ class ProteinTokenInferenceDataset(Dataset):
         if not path.exists():
             raise FileNotFoundError(f"Missing inference embedding for protein {pid}: {path}")
 
-        token_embeddings = torch.load(path, map_location="cpu")
+        token_embeddings = torch.load(path, map_location="cpu", weights_only=True)
         if not isinstance(token_embeddings, torch.Tensor):
             raise TypeError(f"Expected tensor embedding at {path}")
         token_embeddings = token_embeddings.float()

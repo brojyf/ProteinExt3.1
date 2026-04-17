@@ -43,8 +43,8 @@ def focal_bce_with_logits(
     majority of labels are negative.
     """
     bce = F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
-    p = torch.sigmoid(logits)
-    p_t = p * labels + (1.0 - p) * (1.0 - labels)
+    # Math trick: bce without reduction is mathematically equal to -log(p_t)
+    p_t = torch.exp(-bce)
     focal_weight = (1.0 - p_t) ** gamma
     return (focal_weight * bce).mean()
 
@@ -150,16 +150,17 @@ def compute_go_term_soft_f1_loss(
     labels = labels.to(dtype=probs.dtype)
 
     tp = (probs * labels).sum(dim=0)
-    fp = (probs * (1.0 - labels)).sum(dim=0)
-    fn = ((1.0 - probs) * labels).sum(dim=0)
+    pred_pos = probs.sum(dim=0)
+    true_pos = labels.sum(dim=0)
 
-    soft_f1_per_term = (2.0 * tp + eps) / (2.0 * tp + fp + fn + eps)
+    # 2*TP + FP + FN is mathematically equivalent to pred_pos + true_pos
+    soft_f1_per_term = (2.0 * tp + eps) / (pred_pos + true_pos + eps)
     go_term_soft_f1 = soft_f1_per_term.mean()
     go_term_loss = 1.0 - go_term_soft_f1
     return go_term_loss, go_term_soft_f1
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def predict(
     model: nn.Module,
     loader: DataLoader,
@@ -212,6 +213,7 @@ def compute_multilabel_metrics(
 
     y_pred = y_prob >= threshold
     y_true_bool = y_true.astype(bool)
+    total_true = y_true_bool.sum()
     
     best_f1 = 0.0
     best_threshold = threshold
@@ -225,10 +227,10 @@ def compute_multilabel_metrics(
     for candidate in progress:
         candidate_pred = y_prob >= candidate
         tp = np.logical_and(candidate_pred, y_true_bool).sum()
-        fp = np.logical_and(candidate_pred, ~y_true_bool).sum()
-        fn = np.logical_and(~candidate_pred, y_true_bool).sum()
+        pred_positives = candidate_pred.sum()
         
-        denom = 2 * tp + fp + fn
+        # Math trick: 2*TP + FP + FN == pred_positives + total_true
+        denom = pred_positives + total_true
         candidate_f1 = float((2 * tp) / denom) if denom > 0 else 0.0
         
         if candidate_f1 > best_f1:
@@ -236,12 +238,12 @@ def compute_multilabel_metrics(
             best_threshold = float(candidate)
 
     tp_base = np.logical_and(y_pred, y_true_bool).sum()
-    fp_base = np.logical_and(y_pred, ~y_true_bool).sum()
-    fn_base = np.logical_and(~y_pred, y_true_bool).sum()
+    pred_positives_base = y_pred.sum()
 
-    denom_f1 = 2 * tp_base + fp_base + fn_base
-    denom_p = tp_base + fp_base
-    denom_r = tp_base + fn_base
+    denom_f1 = pred_positives_base + total_true
+    denom_p = pred_positives_base
+    # Recall denom = TP + FN = total_true
+    denom_r = total_true
 
     return {
         "micro_f1": float((2 * tp_base) / denom_f1) if denom_f1 > 0 else 0.0,

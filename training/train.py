@@ -147,7 +147,7 @@ def build_loaders(args: SimpleNamespace, fold_data):
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=args.batch_size,
+        batch_size=args.batch_size * 2,
         shuffle=False,
         num_workers=args.num_workers,
         collate_fn=collate_token_embedding_batch,

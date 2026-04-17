@@ -95,7 +95,7 @@ def normalize_prott5_sequence(sequence: str) -> str:
 
 
 def save_embedding_tensor(path: Path, tensor: torch.Tensor) -> None:
-    torch.save(tensor.detach().cpu().to(torch.float16), path)
+    torch.save(tensor, path)
 
 
 def esm2_layer_dir(layer_index: int) -> str:
@@ -142,9 +142,9 @@ def extract_esm2_embeddings(
         with torch.amp.autocast(device.type):
             outputs = model(**tokens, output_hidden_states=True)
 
-        last_hidden = outputs.last_hidden_state
-        layer_hidden = outputs.hidden_states[layer_index]
-        attention_mask = tokens["attention_mask"]
+        last_hidden = outputs.last_hidden_state.detach().cpu().to(torch.float16)
+        layer_hidden = outputs.hidden_states[layer_index].detach().cpu().to(torch.float16)
+        attention_mask = tokens["attention_mask"].cpu()
 
         for index, pid in enumerate(batch_pids):
             valid_length = int(attention_mask[index].sum().item())
@@ -194,8 +194,9 @@ def extract_t5_embeddings(
         tokens = {key: value.to(device) for key, value in tokens.items()}
         with torch.amp.autocast(device.type):
             outputs = model(**tokens)
-        hidden = outputs.last_hidden_state
-        attention_mask = tokens["attention_mask"]
+            
+        hidden = outputs.last_hidden_state.detach().cpu().to(torch.float16)
+        attention_mask = tokens["attention_mask"].cpu()
 
         for index, pid in enumerate(batch_pids):
             valid_length = int(attention_mask[index].sum().item())
