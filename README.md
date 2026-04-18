@@ -24,5 +24,6 @@ python training/late_fusion.py --aspect P/F/C --methods esm2/cnn/blast/t5 --outp
 ## method: fusion  (esm2/cnn/blast/t5)
 ## obo: data/gobsic.obo
 ## cpu: 8
+## weights: model/fusion_weights.csv
 python predict.py
 ```

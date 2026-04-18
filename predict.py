@@ -138,6 +138,12 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_OBO_PATH,
         help="Path to go-basic.obo for GO upward propagation (default: data/go-basic.obo)",
     )
+    parser.add_argument(
+        "--weights",
+        type=Path,
+        default=DEFAULT_MODELS_DIR / "fusion_weights.csv",
+        help="Specific path to a fusion weights CSV file (default: models/fusion_weights.csv)",
+    )
     return parser.parse_args()
 
 
@@ -429,8 +435,7 @@ def union_classes(results_by_method: Dict[str, dict]) -> np.ndarray:
     return np.asarray(ordered, dtype=object)
 
 
-def load_fusion_weights(models_dir: Path, aspect: str) -> dict:
-    path = models_dir / "fusion_weights.csv"
+def load_fusion_weights(path: Path, aspect: str) -> dict:
     if not path.exists():
         raise FileNotFoundError(f"Fusion weights not found: {path}")
     frame = pd.read_csv(path)
@@ -588,7 +593,7 @@ def main() -> None:
                 continue
 
             # Full late fusion: esm2 + t5 + cnn + blast
-            fusion_cfg = load_fusion_weights(DEFAULT_MODELS_DIR, aspect)
+            fusion_cfg = load_fusion_weights(args.weights, aspect)
             component_results = {
                 method: predict_for_method(
                     method=method,
