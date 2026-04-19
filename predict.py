@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
 
 from training.data.data_utils import build_token_hydrophobicity_features, load_fasta_sequences
 from training.data.go_utils import build_propagation_indices, parse_go_obo, propagate_scores
@@ -136,7 +137,12 @@ def parse_args() -> argparse.Namespace:
         "--obo",
         type=Path,
         default=DEFAULT_OBO_PATH,
-        help="Path to go-basic.obo for GO upward propagation (default: data/go-basic.obo)",
+        help="Path to go-basic.obo if --propagate is enabled (default: data/go-basic.obo)",
+    )
+    parser.add_argument(
+        "--propagate",
+        action="store_true",
+        help="Apply GO upward propagation before writing predictions. Disabled by default.",
     )
     parser.add_argument(
         "--weights",
@@ -242,10 +248,13 @@ def checkpoint_candidates(models_dir: Path, method: str, aspect: str) -> List[Pa
     ]
 
 
-def load_checkpoint(models_dir: Path, method: str, aspect: str, device: torch.device) -> dict:
+def load_checkpoint(models_dir: Path, method: str, aspect: str) -> dict:
     for candidate in checkpoint_candidates(models_dir, method, aspect):
         if candidate.exists():
-            payload = torch.load(candidate, map_location=device)
+            # Local training checkpoints include numpy metadata in addition to
+            # tensors, which PyTorch 2.6+ rejects under the default
+            # weights_only=True loader.
+            payload = torch.load(candidate, map_location="cpu", weights_only=False)
             return {"payload": payload, "path": candidate}
     searched = ", ".join(str(path.name) for path in checkpoint_candidates(models_dir, method, aspect))
     raise FileNotFoundError(f"Model checkpoint not found for {method} aspect={aspect}. Searched: {searched}")
@@ -317,10 +326,11 @@ def run_model_inference(
     model.eval()
     all_pids: List[str] = []
     all_probs: List[np.ndarray] = []
+    autocast_device = "cuda" if device.type == "cuda" else "cpu"
 
     for pids, batch_inputs in DataLoaderProgress(loader, progress_desc):
         batch_inputs = move_batch_to_device(batch_inputs, device)
-        with torch.amp.autocast(device.type):
+        with torch.amp.autocast(autocast_device, enabled=device.type == "cuda"):
             logits = model(batch_inputs)
         probs = torch.sigmoid(logits).cpu().numpy()
         all_pids.extend(pids)
@@ -335,14 +345,12 @@ def run_model_inference(
 def move_batch_to_device(batch_inputs: dict, device: torch.device) -> dict:
     moved = {}
     for key, value in batch_inputs.items():
-        moved[key] = value.to(device) if isinstance(value, torch.Tensor) else value
+        moved[key] = value.to(device, non_blocking=device.type == "cuda") if isinstance(value, torch.Tensor) else value
     return moved
 
 
 def DataLoaderProgress(loader: DataLoader, desc: str):
-    from tqdm.auto import tqdm
-
-    return tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
+    return tqdm(loader, desc=desc, leave=True, dynamic_ncols=True)
 
 
 def align_probs_to_reference(
@@ -376,17 +384,18 @@ def predict_for_method(
     device: torch.device,
     num_workers: int = 0,
 ) -> dict:
-    checkpoint_info = load_checkpoint(models_dir, method, aspect, device)
+    checkpoint_info = load_checkpoint(models_dir, method, aspect)
     checkpoint_payload = checkpoint_info["payload"]
     model_args = build_args_from_checkpoint(checkpoint_payload, method)
     classes = load_classes_for_checkpoint(models_dir, checkpoint_info, method, aspect)
-    model = MODEL_BUILDERS[method](model_args, num_classes=len(classes)).to(device)
+    model = MODEL_BUILDERS[method](model_args, num_classes=len(classes))
     state_dict = (
         checkpoint_payload["model_state_dict"]
         if isinstance(checkpoint_payload, dict) and "model_state_dict" in checkpoint_payload
         else checkpoint_payload
     )
     model.load_state_dict(state_dict)
+    model.to(device)
 
     pids = sorted(sequences_by_pid)
     dataset = ProteinTokenInferenceDataset(
@@ -395,12 +404,19 @@ def predict_for_method(
         embedding_dir=embedding_dir,
         **dataset_kwargs_for_method(method, model_args),
     )
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "collate_fn": collate_inference_batch,
+        "pin_memory": device.type == "cuda",
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
     loader = DataLoader(
         dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_inference_batch,
+        **loader_kwargs,
     )
     predictions = run_model_inference(
         model,
@@ -413,6 +429,9 @@ def predict_for_method(
         if isinstance(checkpoint_payload, dict)
         else DEFAULT_THRESHOLD
     )
+    del model, state_dict, checkpoint_payload
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     return {
         "pids": predictions["pids"],
         "probs": predictions["probs"],
@@ -470,18 +489,23 @@ def run_blast_inference(
     return _transfer_scores(query_pids, hits, labels_df, classes, aspect=aspect)
 
 
-def threshold_predictions(
+def collect_prediction_rows(
     *,
     pids: np.ndarray,
     probs: np.ndarray,
     classes: np.ndarray,
-    threshold: float,
+    progress_desc: str = "Collecting predictions",
 ) -> List[tuple[str, str, float]]:
     rows: List[tuple[str, str, float]] = []
-    for row_index, pid in enumerate(pids.tolist()):
-        indices = np.where(probs[row_index] >= threshold)[0]
-        if indices.size == 0 and probs.shape[1] > 0:
-            indices = np.asarray([int(np.argmax(probs[row_index]))], dtype=np.int64)
+    pid_list = pids.tolist()
+    for row_index, pid in tqdm(
+        enumerate(pid_list),
+        total=len(pid_list),
+        desc=progress_desc,
+        leave=True,
+        dynamic_ncols=True,
+    ):
+        indices = np.arange(probs.shape[1], dtype=np.int64)
         indices = indices[np.argsort(probs[row_index, indices])[::-1]]
         for class_index in indices.tolist():
             rows.append((pid, str(classes[class_index]), float(probs[row_index, class_index])))
@@ -513,7 +537,7 @@ def write_predictions(output_path: Path, rows: Sequence[tuple[str, str, float]])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.writer(handle, delimiter="\t")
-        for pid, term, score in rows:
+        for pid, term, score in tqdm(rows, desc="Writing predictions", leave=True, dynamic_ncols=True):
             writer.writerow([pid, term, f"{score:.6f}"])
 
 
@@ -524,7 +548,7 @@ def main() -> None:
     sequences_by_pid = load_sequences(args.input)
     aspects = normalize_aspects(args.aspect)
     output_rows: List[tuple[str, str, float]] = []
-    go_parents = load_go_parents(args.obo)
+    go_parents = load_go_parents(args.obo) if args.propagate else None
 
     if args.method == "blast":
         # Blast-only inference: no embeddings or model checkpoints needed
@@ -543,17 +567,26 @@ def main() -> None:
             if go_parents is not None:
                 blast_scores = apply_go_propagation(blast_scores, classes, go_parents)
             output_rows.extend(
-                threshold_predictions(
+                collect_prediction_rows(
                     pids=query_pids,
                     probs=blast_scores,
                     classes=classes,
-                    threshold=DEFAULT_THRESHOLD,
+                    progress_desc=f"Collecting blast aspect={aspect}",
                 )
             )
     else:
         device = resolve_device()
         print_device_summary(device)
-        needed_methods = methods_needed(args.method)
+        fusion_configs = {}
+        if args.method is None:
+            fusion_configs = {aspect: load_fusion_weights(args.weights, aspect) for aspect in aspects}
+            needed_methods = [
+                method
+                for method in ("esm2", "t5", "cnn")
+                if any(config.get(method, 0.0) > 0 for config in fusion_configs.values())
+            ]
+        else:
+            needed_methods = methods_needed(args.method)
 
         embedding_dir = DEFAULT_EMBEDDING_DIR
         embedding_dir.mkdir(parents=True, exist_ok=True)
@@ -565,7 +598,7 @@ def main() -> None:
             device=device,
         )
 
-        for aspect in aspects:
+        for aspect in tqdm(aspects, desc="Predicting aspects", leave=True, dynamic_ncols=True):
             if args.method is not None:
                 # Single neural method
                 result = predict_for_method(
@@ -579,23 +612,33 @@ def main() -> None:
                     num_workers=args.cpu,
                 )
                 if go_parents is not None:
+                    print(f"Applying GO propagation for {args.method} aspect={aspect} ...")
                     result["probs"] = apply_go_propagation(
                         result["probs"], result["classes"], go_parents
                     )
                 output_rows.extend(
-                    threshold_predictions(
+                    collect_prediction_rows(
                         pids=result["pids"],
                         probs=result["probs"],
                         classes=result["classes"],
-                        threshold=result["threshold"],
+                        progress_desc=f"Collecting {args.method} aspect={aspect}",
                     )
                 )
                 continue
 
             # Full late fusion: esm2 + t5 + cnn + blast
-            fusion_cfg = load_fusion_weights(args.weights, aspect)
-            component_results = {
-                method: predict_for_method(
+            fusion_cfg = fusion_configs[aspect]
+            neural_methods = [
+                method for method in ("esm2", "t5", "cnn") if fusion_cfg.get(method, 0.0) > 0
+            ]
+            component_results = {}
+            for method in tqdm(
+                neural_methods,
+                desc=f"Neural methods aspect={aspect}",
+                leave=True,
+                dynamic_ncols=True,
+            ):
+                component_results[method] = predict_for_method(
                     method=method,
                     aspect=aspect,
                     models_dir=DEFAULT_MODELS_DIR,
@@ -605,13 +648,24 @@ def main() -> None:
                     device=device,
                     num_workers=args.cpu,
                 )
-                for method in ("esm2", "t5", "cnn")
-            }
-            reference_pids = component_results["esm2"]["pids"]
-            fusion_classes = union_classes(component_results)
+
+            if component_results:
+                reference_method = neural_methods[0]
+                reference_pids = component_results[reference_method]["pids"]
+                fusion_classes = union_classes(component_results)
+            else:
+                labels_df = pd.read_csv(ROOT_DIR / "data" / "blast" / "blast.tsv", sep="\t")
+                reference_pids = np.asarray(sorted(sequences_by_pid))
+                fusion_classes = np.asarray(sorted(labels_df[labels_df["aspect"] == aspect]["term"].unique()))
+
             fused_probs = np.zeros((len(reference_pids), len(fusion_classes)), dtype=np.float32)
             total_weight = 0.0
-            for method in ("esm2", "t5", "cnn"):
+            for method in tqdm(
+                neural_methods,
+                desc=f"Fusing neural methods aspect={aspect}",
+                leave=True,
+                dynamic_ncols=True,
+            ):
                 weight = fusion_cfg[method]
                 if weight <= 0:
                     continue
@@ -642,15 +696,19 @@ def main() -> None:
             fused_probs /= total_weight
 
             if go_parents is not None:
+                print(f"Applying GO propagation for late fusion aspect={aspect} ...")
                 fused_probs = apply_go_propagation(fused_probs, fusion_classes, go_parents)
             output_rows.extend(
-                threshold_predictions(
+                collect_prediction_rows(
                     pids=reference_pids,
                     probs=fused_probs,
                     classes=fusion_classes,
-                    threshold=fusion_cfg["threshold"],
+                    progress_desc=f"Collecting late fusion aspect={aspect}",
                 )
             )
+            del component_results, fused_probs
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     write_predictions(args.output, output_rows)
     print(f"Saved predictions to {args.output}")
