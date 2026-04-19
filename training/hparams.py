@@ -31,25 +31,25 @@ COMMON_TRAINING_CONFIG: Dict[str, object] = {
 
 METHOD_HPARAMS: Dict[str, Dict[str, object]] = {
     "esm2": {
-        "pooling": "attention",
-        "hidden_dim": 768,
-        "dropout": 0.35,
+        "pooling": "mean_max_features",
+        "epochs": 25,
+        "hidden_dim": 1024,
+        "dropout": 0.4,
         "window_size": 20,
-        "go_term_loss_weight": 0.30,
+        "go_term_loss_weight": 0.25,
         "optimizer": {
-            "attention_lr": 2e-4,
-            "classifier_lr": 6e-4,
+            "classifier_lr": 4e-4,
         },
     },
     "t5": {
-        "pooling": "attention",
-        "hidden_dim": 768,
-        "dropout": 0.4,
+        "pooling": "mean_max_features",
+        "epochs": 25,
+        "hidden_dim": 1024,
+        "dropout": 0.45,
         "window_size": 20,
         "go_term_loss_weight": 0.20,
         "optimizer": {
-            "attention_lr": 1.5e-4,
-            "classifier_lr": 5e-4,
+            "classifier_lr": 3.5e-4,
         },
     },
     "cnn": {

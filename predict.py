@@ -17,7 +17,12 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 
-from training.data.data_utils import build_token_hydrophobicity_features, load_fasta_sequences
+from training.data.data_utils import (
+    PROTEIN_FEATURE_DIM,
+    build_sequence_protein_features,
+    build_token_hydrophobicity_features,
+    load_fasta_sequences,
+)
 from training.data.go_utils import build_propagation_indices, parse_go_obo, propagate_scores
 from training.data.embedding import (
     DEFAULT_ESM2_INTERMEDIATE_LAYER,
@@ -46,7 +51,7 @@ DEFAULT_BATCH_SIZE = 2
 DEFAULT_THRESHOLD = 0.5
 DEFAULT_ESM2_EMBEDDING_DIM = 1280
 DEFAULT_T5_EMBEDDING_DIM = 1024
-DEFAULT_POOLING = "mean"
+DEFAULT_POOLING = "mean_max_features"
 DEFAULT_DROPOUT = 0.4
 DEFAULT_HIDDEN_DIM = 1024
 
@@ -60,6 +65,7 @@ class ProteinTokenInferenceDataset(Dataset):
         plm: str,
         layer: str,
         hydro_window_size: int | None = None,
+        include_protein_features: bool = False,
     ) -> None:
         self.pids = list(pids)
         self.sequences = sequences
@@ -67,6 +73,8 @@ class ProteinTokenInferenceDataset(Dataset):
         self.plm = plm
         self.layer = layer
         self.hydro_window_size = hydro_window_size
+        self.include_protein_features = include_protein_features
+        self._protein_feature_cache: Dict[str, torch.Tensor] = {}
 
     def __len__(self) -> int:
         return len(self.pids)
@@ -90,11 +98,18 @@ class ProteinTokenInferenceDataset(Dataset):
                 window_size=self.hydro_window_size,
             )
 
-        return pid, token_embeddings, hydro_features
+        protein_features = None
+        if self.include_protein_features:
+            protein_features = self._protein_feature_cache.get(pid)
+            if protein_features is None:
+                protein_features = build_sequence_protein_features(self.sequences[pid])
+                self._protein_feature_cache[pid] = protein_features
+
+        return pid, token_embeddings, hydro_features, protein_features
 
 
 def collate_inference_batch(batch):
-    pids, token_embeddings, hydro_features = zip(*batch)
+    pids, token_embeddings, hydro_features, protein_features = zip(*batch)
     batch_size = len(batch)
     max_length = max(tensor.size(0) for tensor in token_embeddings)
     embedding_dim = token_embeddings[0].size(-1)
@@ -107,6 +122,11 @@ def collate_inference_batch(batch):
     if use_hydro:
         hydro_dim = hydro_features[0].size(-1)
         padded_hydro = torch.zeros((batch_size, max_length, hydro_dim), dtype=torch.float32)
+
+    use_protein_features = protein_features[0] is not None
+    stacked_protein_features = None
+    if use_protein_features:
+        stacked_protein_features = torch.stack(list(protein_features), dim=0)
 
     for index, token_tensor in enumerate(token_embeddings):
         length = token_tensor.size(0)
@@ -121,6 +141,8 @@ def collate_inference_batch(batch):
     }
     if padded_hydro is not None:
         batch_inputs["hydro_features"] = padded_hydro
+    if stacked_protein_features is not None:
+        batch_inputs["protein_features"] = stacked_protein_features
 
     return list(pids), batch_inputs
 
@@ -276,6 +298,7 @@ def build_args_from_checkpoint(checkpoint_payload: dict, method: str) -> SimpleN
         window_size=window_size,
         esm2_embedding_dim=saved_args.get("esm2_embedding_dim", DEFAULT_ESM2_EMBEDDING_DIM),
         t5_embedding_dim=saved_args.get("t5_embedding_dim", DEFAULT_T5_EMBEDDING_DIM),
+        protein_feature_dim=saved_args.get("protein_feature_dim", PROTEIN_FEATURE_DIM),
     )
 
 
@@ -304,14 +327,25 @@ def load_classes_for_checkpoint(models_dir: Path, checkpoint_info: dict, method:
 
 def dataset_kwargs_for_method(method: str, args_ns: SimpleNamespace) -> dict:
     if method == "esm2":
-        return {"plm": "esm2", "layer": "last", "hydro_window_size": None}
+        return {
+            "plm": "esm2",
+            "layer": "last",
+            "hydro_window_size": None,
+            "include_protein_features": True,
+        }
     if method == "t5":
-        return {"plm": "t5", "layer": "last", "hydro_window_size": None}
+        return {
+            "plm": "t5",
+            "layer": "last",
+            "hydro_window_size": None,
+            "include_protein_features": True,
+        }
     if method == "cnn":
         return {
             "plm": "esm2",
             "layer": esm2_layer_dir(DEFAULT_ESM2_INTERMEDIATE_LAYER),
             "hydro_window_size": args_ns.window_size,
+            "include_protein_features": False,
         }
     raise ValueError(f"Unsupported inference method: {method}")
 

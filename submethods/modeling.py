@@ -22,6 +22,14 @@ class MeanPooling(nn.Module):
         return summed / denom
 
 
+class MaxPooling(nn.Module):
+    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        mask = attention_mask.unsqueeze(-1).expand_as(hidden_states)
+        fill = torch.full_like(hidden_states, float("-inf"))
+        pooled = torch.where(mask > 0, hidden_states, fill).amax(dim=1)
+        return torch.where(torch.isfinite(pooled), pooled, torch.zeros_like(pooled))
+
+
 class AttentionPooling(nn.Module):
     def __init__(self, input_dim: int) -> None:
         super().__init__()

@@ -82,7 +82,10 @@ def print_device_summary(device: torch.device) -> None:
 
 
 def namespace_from_config(config: dict) -> SimpleNamespace:
+    from training.data.data_utils import PROTEIN_FEATURE_DIM
+
     resolved = dict(config)
+    resolved.setdefault("protein_feature_dim", PROTEIN_FEATURE_DIM)
     resolved["output_dir"] = DEFAULT_OUTPUT_DIR
     resolved["oof_dir"] = DEFAULT_OOF_DIR
     resolved["device"] = resolve_device(str(config.get("device", "auto")))
@@ -103,14 +106,25 @@ def build_datasets(args: SimpleNamespace, fold_data):
     from training.data.embedding import DEFAULT_ESM2_INTERMEDIATE_LAYER, esm2_layer_dir
 
     if args.method == "t5":
-        dataset_kwargs = {"plm": "t5", "layer": "last", "hydro_window_size": None}
+        dataset_kwargs = {
+            "plm": "t5",
+            "layer": "last",
+            "hydro_window_size": None,
+            "include_protein_features": True,
+        }
     elif args.method == "esm2":
-        dataset_kwargs = {"plm": "esm2", "layer": "last", "hydro_window_size": None}
+        dataset_kwargs = {
+            "plm": "esm2",
+            "layer": "last",
+            "hydro_window_size": None,
+            "include_protein_features": True,
+        }
     elif args.method == "cnn":
         dataset_kwargs = {
             "plm": "esm2",
             "layer": esm2_layer_dir(DEFAULT_ESM2_INTERMEDIATE_LAYER),
             "hydro_window_size": args.window_size,
+            "include_protein_features": False,
         }
     else:
         raise ValueError(f"Unsupported training method: {args.method}")
