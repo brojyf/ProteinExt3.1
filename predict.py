@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -159,18 +160,25 @@ def parse_args() -> argparse.Namespace:
         "--obo",
         type=Path,
         default=DEFAULT_OBO_PATH,
-        help="Path to go-basic.obo if --propagate is enabled (default: data/go-basic.obo)",
+        help="Path to go-basic.obo for default GO propagation (default: data/go-basic.obo)",
     )
     parser.add_argument(
-        "--propagate",
-        action="store_true",
-        help="Apply GO upward propagation before writing predictions. Disabled by default.",
+        "--no-propagate",
+        dest="propagate",
+        action="store_false",
+        help="Disable default GO upward propagation before writing predictions.",
     )
+    parser.set_defaults(propagate=True)
     parser.add_argument(
         "--weights",
         type=Path,
         default=DEFAULT_MODELS_DIR / "fusion_weights.csv",
         help="Specific path to a fusion weights CSV file (default: models/fusion_weights.csv)",
+    )
+    parser.add_argument(
+        "--no-ensemble",
+        action="store_true",
+        help="Disable fold ensemble; use only the best-fold checkpoint.",
     )
     return parser.parse_args()
 
@@ -345,7 +353,7 @@ def dataset_kwargs_for_method(method: str, args_ns: SimpleNamespace) -> dict:
             "plm": "esm2",
             "layer": esm2_layer_dir(DEFAULT_ESM2_INTERMEDIATE_LAYER),
             "hydro_window_size": args_ns.window_size,
-            "include_protein_features": False,
+            "include_protein_features": True,
         }
     raise ValueError(f"Unsupported inference method: {method}")
 
@@ -407,6 +415,61 @@ def align_probs_to_reference(
     return aligned
 
 
+def find_fold_checkpoints(models_dir: Path, method: str, aspect: str) -> List[Path]:
+    """Find fold checkpoint files for ensemble inference."""
+    fold_prefix = f"{method}_{aspect}_fold"
+    fold_paths: List[tuple[int, Path]] = []
+    for path in models_dir.glob(f"{fold_prefix}*.pt"):
+        suffix = path.stem.removeprefix(fold_prefix)
+        if suffix.isdigit():
+            fold_paths.append((int(suffix), path))
+    return [path for _, path in sorted(fold_paths)]
+
+
+def _run_single_checkpoint(
+    checkpoint_path: Path,
+    method: str,
+    aspect: str,
+    models_dir: Path,
+    loader: DataLoader,
+    device: torch.device,
+    progress_desc: str,
+) -> dict:
+    """Run inference for a single checkpoint and return pids, probs, classes, threshold."""
+    payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    model_args = build_args_from_checkpoint(payload, method)
+    classes = np.asarray(payload["classes"]) if isinstance(payload, dict) and "classes" in payload else None
+    if classes is None:
+        # Fallback: try loading from separate files
+        checkpoint_info = {"payload": payload, "path": checkpoint_path}
+        classes = load_classes_for_checkpoint(models_dir, checkpoint_info, method, aspect)
+
+    model = MODEL_BUILDERS[method](model_args, num_classes=len(classes))
+    state_dict = (
+        payload["model_state_dict"]
+        if isinstance(payload, dict) and "model_state_dict" in payload
+        else payload
+    )
+    model.load_state_dict(state_dict)
+    model.to(device)
+
+    predictions = run_model_inference(model, loader, device, progress_desc=progress_desc)
+    threshold = float(
+        payload.get("metrics", {}).get("fmax_threshold", DEFAULT_THRESHOLD)
+        if isinstance(payload, dict)
+        else DEFAULT_THRESHOLD
+    )
+    del model, state_dict, payload
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return {
+        "pids": predictions["pids"],
+        "probs": predictions["probs"],
+        "classes": classes,
+        "threshold": threshold,
+    }
+
+
 def predict_for_method(
     *,
     method: str,
@@ -417,19 +480,20 @@ def predict_for_method(
     batch_size: int,
     device: torch.device,
     num_workers: int = 0,
+    ensemble: bool = True,
 ) -> dict:
-    checkpoint_info = load_checkpoint(models_dir, method, aspect)
-    checkpoint_payload = checkpoint_info["payload"]
-    model_args = build_args_from_checkpoint(checkpoint_payload, method)
-    classes = load_classes_for_checkpoint(models_dir, checkpoint_info, method, aspect)
-    model = MODEL_BUILDERS[method](model_args, num_classes=len(classes))
-    state_dict = (
-        checkpoint_payload["model_state_dict"]
-        if isinstance(checkpoint_payload, dict) and "model_state_dict" in checkpoint_payload
-        else checkpoint_payload
-    )
-    model.load_state_dict(state_dict)
-    model.to(device)
+    fold_paths = find_fold_checkpoints(models_dir, method, aspect) if ensemble else []
+    checkpoint_payload = None
+    classes = None
+    if fold_paths:
+        first_payload = torch.load(fold_paths[0], map_location="cpu", weights_only=False)
+        model_args = build_args_from_checkpoint(first_payload, method)
+        del first_payload
+    else:
+        checkpoint_info = load_checkpoint(models_dir, method, aspect)
+        checkpoint_payload = checkpoint_info["payload"]
+        model_args = build_args_from_checkpoint(checkpoint_payload, method)
+        classes = load_classes_for_checkpoint(models_dir, checkpoint_info, method, aspect)
 
     pids = sorted(sequences_by_pid)
     dataset = ProteinTokenInferenceDataset(
@@ -448,14 +512,63 @@ def predict_for_method(
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 2
-    loader = DataLoader(
-        dataset,
-        **loader_kwargs,
+    loader = DataLoader(dataset, **loader_kwargs)
+
+    if fold_paths:
+        print(f"  Ensemble: using {len(fold_paths)} fold checkpoint(s) for {method} aspect={aspect}")
+        fold_results = []
+        thresholds = []
+        result_pids = None
+        for fold_path in fold_paths:
+            fold_result = _run_single_checkpoint(
+                fold_path, method, aspect, models_dir, loader, device,
+                progress_desc=f"Predicting {method} {aspect} ({fold_path.stem})",
+            )
+            if result_pids is None:
+                result_pids = fold_result["pids"]
+            fold_results.append(fold_result)
+            thresholds.append(fold_result["threshold"])
+
+        seen_classes = set()
+        ordered_classes: List[str] = []
+        for fold_result in fold_results:
+            for term in fold_result["classes"].tolist():
+                if term not in seen_classes:
+                    seen_classes.add(term)
+                    ordered_classes.append(term)
+        classes = np.asarray(ordered_classes, dtype=object)
+
+        all_probs = [
+            align_probs_to_reference(
+                pids=result_pids,
+                source_pids=fold_result["pids"],
+                source_probs=fold_result["probs"],
+                reference_classes=classes,
+                source_classes=fold_result["classes"],
+            )
+            for fold_result in fold_results
+        ]
+        ensemble_probs = np.mean(all_probs, axis=0).astype(np.float32)
+        return {
+            "pids": result_pids,
+            "probs": ensemble_probs,
+            "classes": classes,
+            "threshold": float(np.mean(thresholds)) if thresholds else DEFAULT_THRESHOLD,
+        }
+
+    # Single model fallback
+    if checkpoint_payload is None or classes is None:
+        raise RuntimeError(f"Missing best checkpoint payload for {method} aspect={aspect}")
+    model = MODEL_BUILDERS[method](model_args, num_classes=len(classes))
+    state_dict = (
+        checkpoint_payload["model_state_dict"]
+        if isinstance(checkpoint_payload, dict) and "model_state_dict" in checkpoint_payload
+        else checkpoint_payload
     )
+    model.load_state_dict(state_dict)
+    model.to(device)
     predictions = run_model_inference(
-        model,
-        loader,
-        device,
+        model, loader, device,
         progress_desc=f"Predicting {method} aspect={aspect}",
     )
     threshold = float(
@@ -503,6 +616,26 @@ def load_fusion_weights(path: Path, aspect: str) -> dict:
         "blast": float(item.get("W_BLAST", 0.0)),
         "threshold": float(item.get("THRESHOLD", DEFAULT_THRESHOLD)),
     }
+
+
+def load_fusion_temperatures(weights_csv_path: Path, aspect: str) -> Dict[str, float]:
+    """Load per-method temperature scaling parameters from the fusion summary JSON."""
+    json_path = weights_csv_path.with_name(weights_csv_path.stem + "_summary.json")
+    if not json_path.exists():
+        return {}
+    with json_path.open("r", encoding="utf-8") as handle:
+        summary = json.load(handle)
+    aspect_data = summary.get(aspect, {})
+    return {method: float(t) for method, t in aspect_data.get("temperatures", {}).items()}
+
+
+def apply_temperature_scaling(probs: np.ndarray, temperature: float) -> np.ndarray:
+    """Apply temperature scaling: calibrated = sigmoid(logit(prob) / T)."""
+    if abs(temperature - 1.0) < 1e-6:
+        return probs
+    p = np.clip(probs, 1e-7, 1.0 - 1e-7)
+    logit_p = np.log(p / (1.0 - p))
+    return (1.0 / (1.0 + np.exp(-logit_p / temperature))).astype(probs.dtype)
 
 
 def run_blast_inference(
@@ -644,6 +777,7 @@ def main() -> None:
                     batch_size=args.batchsize,
                     device=device,
                     num_workers=args.cpu,
+                    ensemble=not args.no_ensemble,
                 )
                 if go_parents is not None:
                     print(f"Applying GO propagation for {args.method} aspect={aspect} ...")
@@ -662,6 +796,7 @@ def main() -> None:
 
             # Full late fusion: esm2 + t5 + cnn + blast
             fusion_cfg = fusion_configs[aspect]
+            temperatures = load_fusion_temperatures(args.weights, aspect)
             neural_methods = [
                 method for method in ("esm2", "t5", "cnn") if fusion_cfg.get(method, 0.0) > 0
             ]
@@ -681,7 +816,14 @@ def main() -> None:
                     batch_size=args.batchsize,
                     device=device,
                     num_workers=args.cpu,
+                    ensemble=not args.no_ensemble,
                 )
+                # Apply temperature scaling if available
+                t = temperatures.get(method)
+                if t is not None and abs(t - 1.0) > 1e-6:
+                    component_results[method]["probs"] = apply_temperature_scaling(
+                        component_results[method]["probs"], t
+                    )
 
             if component_results:
                 reference_method = neural_methods[0]
@@ -722,6 +864,9 @@ def main() -> None:
                     aspect=aspect,
                     num_threads=args.cpu,
                 )
+                blast_t = temperatures.get("blast")
+                if blast_t is not None and abs(blast_t - 1.0) > 1e-6:
+                    blast_scores = apply_temperature_scaling(blast_scores, blast_t)
                 fused_probs += blast_weight * blast_scores
                 total_weight += blast_weight
 

@@ -19,8 +19,11 @@ COMMON_TRAINING_CONFIG: Dict[str, object] = {
     # --- Performance enhancements ---
     "use_amp": True,                     # Mixed precision (FP16) on CUDA
     "gradient_accumulation_steps": 2,    # Effective batch_size = batch_size * 2
-    "focal_gamma": 2.0,                 # Focal loss γ; 0 = standard BCE
-    "label_smoothing": 0.05,            # Shift hard 0/1 labels toward 0.5
+    "focal_gamma": 0.0,                 # Focal loss γ; 0 = disabled (using ASL instead)
+    "asl_gamma_neg": 4.0,               # ASL negative focusing; 0 = disabled
+    "asl_gamma_pos": 0.0,               # ASL positive focusing; 0 = no down-weight on positives
+    "asl_clip": 0.05,                   # ASL probability shifting for negatives
+    "label_smoothing": 0.0,              # Disabled; rely on ASL for class imbalance
     "max_grad_norm": 1.0,               # Gradient clipping; 0 = disabled
     "scheduler": {
         "warmup_ratio": 0.08,

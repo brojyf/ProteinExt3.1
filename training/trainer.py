@@ -49,6 +49,41 @@ def focal_bce_with_logits(
     return (focal_weight * bce).mean()
 
 
+def asymmetric_loss_with_logits(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    gamma_neg: float = 4.0,
+    gamma_pos: float = 0.0,
+    clip: float = 0.05,
+) -> torch.Tensor:
+    """
+    Asymmetric Loss for multi-label classification (Ridnik et al., ICCV 2021).
+
+    Applies different focusing parameters for positive and negative samples,
+    plus probability shifting on negatives to further suppress easy negatives.
+    Designed for extreme label imbalance (95%+ negatives) typical in GO annotation.
+    """
+    probs = torch.sigmoid(logits)
+
+    # Probability shifting: reduce negative probabilities to suppress easy negatives
+    probs_neg = (probs - clip).clamp(min=0.0)
+
+    # Separate positive and negative log-probabilities
+    log_pos = torch.log(probs.clamp(min=1e-8))
+    log_neg = torch.log((1.0 - probs_neg).clamp(min=1e-8))
+
+    # Asymmetric focal weighting
+    if gamma_pos > 0:
+        pos_weight = (1.0 - probs) ** gamma_pos
+        log_pos = log_pos * pos_weight
+    if gamma_neg > 0:
+        neg_weight = probs_neg ** gamma_neg
+        log_neg = log_neg * neg_weight
+
+    loss = -(labels * log_pos + (1.0 - labels) * log_neg)
+    return loss.mean()
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -62,6 +97,9 @@ def train_one_epoch(
     focal_gamma: float = 0.0,
     label_smoothing: float = 0.0,
     max_grad_norm: float = 0.0,
+    asl_gamma_neg: float = 0.0,
+    asl_gamma_pos: float = 0.0,
+    asl_clip: float = 0.05,
 ) -> EpochResult:
     model.train()
     use_amp = scaler is not None
@@ -84,19 +122,29 @@ def train_one_epoch(
         batch_inputs = move_batch_to_device(batch_inputs, device)
         labels = labels.to(device)
 
-        # Label smoothing: shift hard 0/1 targets toward 0.5
+        # Preserve hard labels for soft F1 loss (must not be smoothed)
+        hard_labels = labels
+
+        # Label smoothing: shift hard 0/1 targets toward 0.5 (only for BCE/focal)
         if label_smoothing > 0:
-            labels = labels * (1.0 - label_smoothing) + label_smoothing * 0.5
+            smoothed_labels = labels * (1.0 - label_smoothing) + label_smoothing * 0.5
+        else:
+            smoothed_labels = labels
 
         with torch.amp.autocast(device.type, enabled=use_amp):
             logits = model(batch_inputs)
 
-            if focal_gamma > 0:
-                bce_loss = focal_bce_with_logits(logits, labels, gamma=focal_gamma)
+            if asl_gamma_neg > 0:
+                bce_loss = asymmetric_loss_with_logits(
+                    logits, smoothed_labels,
+                    gamma_neg=asl_gamma_neg, gamma_pos=asl_gamma_pos, clip=asl_clip,
+                )
+            elif focal_gamma > 0:
+                bce_loss = focal_bce_with_logits(logits, smoothed_labels, gamma=focal_gamma)
             else:
-                bce_loss = F.binary_cross_entropy_with_logits(logits, labels)
+                bce_loss = F.binary_cross_entropy_with_logits(logits, smoothed_labels)
 
-            go_term_loss, go_term_soft_f1 = compute_go_term_soft_f1_loss(logits, labels)
+            go_term_loss, go_term_soft_f1 = compute_go_term_soft_f1_loss(logits, hard_labels)
             loss = bce_loss + float(go_term_loss_weight) * go_term_loss
             loss = loss / gradient_accumulation_steps
 
@@ -249,6 +297,66 @@ def compute_multilabel_metrics(
         "micro_f1": float((2 * tp_base) / denom_f1) if denom_f1 > 0 else 0.0,
         "micro_precision": float(tp_base / denom_p) if denom_p > 0 else 0.0,
         "micro_recall": float(tp_base / denom_r) if denom_r > 0 else 0.0,
+        "fmax": best_f1,
+        "fmax_threshold": best_threshold,
+    }
+
+
+@torch.inference_mode()
+def evaluate_multilabel_metrics(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    threshold: float = 0.5,
+    progress_desc: str | None = None,
+    use_amp: bool = False,
+) -> Dict[str, float]:
+    model.eval()
+    thresholds = np.linspace(0.01, 0.99, 99)
+    threshold_tp = np.zeros(thresholds.shape[0], dtype=np.int64)
+    threshold_pred_positives = np.zeros(thresholds.shape[0], dtype=np.int64)
+    total_true = 0
+    base_tp = 0
+    base_pred_positives = 0
+
+    progress = tqdm(
+        loader,
+        desc=progress_desc or "Validation Metrics",
+        leave=False,
+        dynamic_ncols=True,
+    )
+
+    for _, batch_inputs, labels in progress:
+        batch_inputs = move_batch_to_device(batch_inputs, device)
+        with torch.amp.autocast(device.type, enabled=use_amp):
+            logits = model(batch_inputs)
+        probs = torch.sigmoid(logits).float().cpu().numpy()
+        labels_bool = labels.numpy().astype(bool, copy=False)
+        total_true += int(labels_bool.sum())
+
+        base_pred = probs >= threshold
+        base_tp += int(np.logical_and(base_pred, labels_bool).sum())
+        base_pred_positives += int(base_pred.sum())
+
+        for index, candidate in enumerate(thresholds):
+            candidate_pred = probs >= candidate
+            threshold_tp[index] += int(np.logical_and(candidate_pred, labels_bool).sum())
+            threshold_pred_positives[index] += int(candidate_pred.sum())
+
+    best_f1 = 0.0
+    best_threshold = threshold
+    for candidate, tp, pred_positives in zip(thresholds, threshold_tp, threshold_pred_positives):
+        denom = int(pred_positives) + total_true
+        candidate_f1 = float((2 * int(tp)) / denom) if denom > 0 else 0.0
+        if candidate_f1 > best_f1:
+            best_f1 = candidate_f1
+            best_threshold = float(candidate)
+
+    denom_f1 = base_pred_positives + total_true
+    return {
+        "micro_f1": float((2 * base_tp) / denom_f1) if denom_f1 > 0 else 0.0,
+        "micro_precision": float(base_tp / base_pred_positives) if base_pred_positives > 0 else 0.0,
+        "micro_recall": float(base_tp / total_true) if total_true > 0 else 0.0,
         "fmax": best_f1,
         "fmax_threshold": best_threshold,
     }

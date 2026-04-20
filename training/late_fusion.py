@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--oof-dir", type=Path, default=DEFAULT_OOF_DIR)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_DIR / "fusion_weights.csv",
                         help="Exact file path to save the output CSV. A JSON summary will be saved alongside it.")
-    parser.add_argument("--weight-step", type=float, default=0.1)
+    parser.add_argument("--weight-step", type=float, default=0.05)
     parser.add_argument("--threshold-start", type=float, default=0.1)
     parser.add_argument("--threshold-stop", type=float, default=0.9)
     parser.add_argument("--threshold-step", type=float, default=0.05)
@@ -230,6 +230,53 @@ def collect_oof_predictions(
     except Exception:
         tmpdir.cleanup()
         raise
+
+
+def calibrate_temperature(
+    probs: np.ndarray,
+    labels: np.ndarray,
+    chunk_size: int = 4096,
+) -> float:
+    """
+    Fit a single temperature parameter T that minimizes NLL on the given
+    labels. calibrated = sigmoid(logit(prob) / T).
+
+    Operates in chunks to avoid materialising full float64 copies of large
+    memmap arrays. Returns T >= 0.1.
+    """
+    from scipy.optimize import minimize_scalar
+
+    def nll_at_temperature(log_t: float) -> float:
+        t = np.exp(log_t)
+        total_nll = 0.0
+        n_total = 0
+        for start in range(0, probs.shape[0], chunk_size):
+            end = min(start + chunk_size, probs.shape[0])
+            p = np.asarray(probs[start:end], dtype=np.float64).clip(1e-7, 1.0 - 1e-7)
+            y = np.asarray(labels[start:end], dtype=np.float64)
+            logit_p = np.log(p / (1.0 - p))
+            scaled = 1.0 / (1.0 + np.exp(-logit_p / t))
+            nll = -(y * np.log(scaled + 1e-12) + (1.0 - y) * np.log(1.0 - scaled + 1e-12))
+            total_nll += float(nll.sum())
+            n_total += nll.size
+        return total_nll / max(n_total, 1)
+
+    result = minimize_scalar(nll_at_temperature, bounds=(np.log(0.1), np.log(10.0)), method="bounded")
+    return float(np.exp(result.x))
+
+
+def apply_temperature_inplace(probs: np.ndarray, temperature: float, chunk_size: int = 4096) -> None:
+    """Apply temperature scaling to a memmap probability array in-place."""
+    if abs(temperature - 1.0) < 1e-6:
+        return
+    for start in range(0, probs.shape[0], chunk_size):
+        end = min(start + chunk_size, probs.shape[0])
+        p = np.asarray(probs[start:end], dtype=np.float32).clip(1e-7, 1.0 - 1e-7)
+        logit_p = np.log(p / (1.0 - p))
+        calibrated = 1.0 / (1.0 + np.exp(-logit_p / temperature))
+        probs[start:end] = calibrated.astype(probs.dtype)
+    if hasattr(probs, "flush"):
+        probs.flush()
 
 
 def generate_weight_grid(methods: List[str], step: float) -> Iterable[Dict[str, float]]:
@@ -526,30 +573,25 @@ def search_best_fusion(
 
     best = None
     for weight_idx, weights in enumerate(grid):
+        # Find fmax (best F1 across all thresholds) for this weight combination
+        weight_fmax = 0.0
+        weight_best_threshold = float(thresholds[0])
         for threshold_idx, threshold in enumerate(thresholds):
-            metrics = metrics_from_counts(
-                int(true_positives[weight_idx, threshold_idx]),
-                int(pred_positives[weight_idx, threshold_idx]),
-                total_true,
-                float(threshold),
-            )
-            candidate = {
-                "weights": weights,
-                "threshold": float(threshold),
-                "metrics": metrics,
-            }
-            if best is None:
-                best = candidate
-                continue
+            tp = int(true_positives[weight_idx, threshold_idx])
+            pp = int(pred_positives[weight_idx, threshold_idx])
+            denom = pp + total_true
+            f1 = float((2 * tp) / denom) if denom > 0 else 0.0
+            if f1 > weight_fmax:
+                weight_fmax = f1
+                weight_best_threshold = float(threshold)
 
-            current_key = (metrics["micro_f1"], metrics["micro_precision"], metrics["micro_recall"])
-            best_key = (
-                best["metrics"]["micro_f1"],
-                best["metrics"]["micro_precision"],
-                best["metrics"]["micro_recall"],
-            )
-            if current_key > best_key:
-                best = candidate
+        candidate = {
+            "weights": weights,
+            "threshold": weight_best_threshold,
+            "metrics": {"fmax": weight_fmax},
+        }
+        if best is None or weight_fmax > best["metrics"]["fmax"]:
+            best = candidate
 
     if best is None:
         raise RuntimeError("No fusion candidates were evaluated")
@@ -661,6 +703,14 @@ def main() -> None:
         print(f"\nSearching late fusion for aspect={aspect} using methods={args.methods}")
         payload = collect_oof_predictions(args.oof_dir, args.methods, aspect, args.fold, args.cache_dir)
         try:
+            # Temperature calibration per method
+            temperatures = {}
+            for method in args.methods:
+                t = calibrate_temperature(payload["probs"][method], payload["labels"], chunk_size=args.chunk_size)
+                temperatures[method] = t
+                print(f"  Temperature for {method}: {t:.4f}")
+                apply_temperature_inplace(payload["probs"][method], t, chunk_size=args.chunk_size)
+
             print(f"  Building propagation indices for {len(payload['classes'])} classes ...")
             prop_indices = build_propagation_indices(payload["classes"], go_parents)
 
@@ -682,6 +732,7 @@ def main() -> None:
                 "weights": best["weights"],
                 "threshold": best["threshold"],
                 "metrics": best["metrics"],
+                "temperatures": temperatures,
                 "num_proteins": int(payload["labels"].shape[0]),
                 "num_classes": int(payload["labels"].shape[1]),
             }

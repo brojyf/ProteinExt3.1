@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
 import json
 import math
 import sys
@@ -19,6 +20,24 @@ from torch.utils.data import DataLoader
 
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "models"
 DEFAULT_OOF_DIR = ROOT_DIR / "training" / "oof"
+
+
+def state_dict_to_cpu(state_dict: dict) -> dict:
+    return {
+        key: value.detach().cpu().clone() if isinstance(value, torch.Tensor) else copy.deepcopy(value)
+        for key, value in state_dict.items()
+    }
+
+
+def release_fold_result(result: dict | None, device: torch.device | None = None) -> None:
+    if result is None:
+        return
+    result.pop("payload", None)
+    result.pop("checkpoint", None)
+    result.pop("classes", None)
+    gc.collect()
+    if device is not None and device.type == "cuda":
+        torch.cuda.empty_cache()
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,7 +143,7 @@ def build_datasets(args: SimpleNamespace, fold_data):
             "plm": "esm2",
             "layer": esm2_layer_dir(DEFAULT_ESM2_INTERMEDIATE_LAYER),
             "hydro_window_size": args.window_size,
-            "include_protein_features": False,
+            "include_protein_features": True,
         }
     else:
         raise ValueError(f"Unsupported training method: {args.method}")
@@ -312,7 +331,12 @@ def format_lrs(optimizer: torch.optim.Optimizer) -> str:
 def run_fold(args: SimpleNamespace, fold: int) -> dict:
     from training.data.data_utils import load_fold_data
     from submethods import MODEL_BUILDERS
-    from training.trainer import compute_multilabel_metrics, predict, train_one_epoch
+    from training.trainer import (
+        compute_multilabel_metrics,
+        evaluate_multilabel_metrics,
+        predict,
+        train_one_epoch,
+    )
 
     fold_data = load_fold_data(fold=fold, aspect=args.aspect)
     device = args.device
@@ -324,6 +348,9 @@ def run_fold(args: SimpleNamespace, fold: int) -> dict:
     focal_gamma = float(getattr(args, "focal_gamma", 0.0))
     label_smoothing = float(getattr(args, "label_smoothing", 0.0))
     max_grad_norm = float(getattr(args, "max_grad_norm", 0.0))
+    asl_gamma_neg = float(getattr(args, "asl_gamma_neg", 0.0))
+    asl_gamma_pos = float(getattr(args, "asl_gamma_pos", 0.0))
+    asl_clip = float(getattr(args, "asl_clip", 0.05))
 
     model = MODEL_BUILDERS[args.method](args, num_classes=len(fold_data.classes)).to(device)
     train_loader, val_loader = build_loaders(args, fold_data)
@@ -343,9 +370,10 @@ def run_fold(args: SimpleNamespace, fold: int) -> dict:
         f"  optimizer_lrs: {format_lrs(optimizer)} | "
         f"scheduler=warmup+cosine | warmup_steps={warmup_steps} | total_steps={total_steps}"
     )
+    loss_desc = f"asl(neg={asl_gamma_neg},pos={asl_gamma_pos},clip={asl_clip})" if asl_gamma_neg > 0 else f"focal(gamma={focal_gamma})"
     print(
         f"  amp={use_amp} | grad_accum={grad_accum} | max_grad_norm={max_grad_norm} | "
-        f"focal_gamma={focal_gamma} | label_smoothing={label_smoothing}"
+        f"loss={loss_desc} | label_smoothing={label_smoothing}"
     )
 
     best_fmax = -1.0
@@ -367,19 +395,17 @@ def run_fold(args: SimpleNamespace, fold: int) -> dict:
             focal_gamma=focal_gamma,
             label_smoothing=label_smoothing,
             max_grad_norm=max_grad_norm,
+            asl_gamma_neg=asl_gamma_neg,
+            asl_gamma_pos=asl_gamma_pos,
+            asl_clip=asl_clip,
         )
-        epoch_predictions = predict(
+        epoch_metrics = evaluate_multilabel_metrics(
             model,
             val_loader,
             device,
-            progress_desc=f"Fold {fold} Epoch {epoch}/{args.epochs} Validation",
-            use_amp=use_amp,
-        )
-        epoch_metrics = compute_multilabel_metrics(
-            y_true=epoch_predictions["labels"],
-            y_prob=epoch_predictions["probs"],
             threshold=args.threshold,
-            progress_desc=f"Fold {fold} Epoch {epoch}/{args.epochs} Fmax",
+            progress_desc=f"Fold {fold} Epoch {epoch}/{args.epochs} Validation Metrics",
+            use_amp=use_amp,
         )
         epoch_lrs = current_lrs(optimizer)
 
@@ -387,7 +413,7 @@ def run_fold(args: SimpleNamespace, fold: int) -> dict:
         if is_best:
             best_fmax = epoch_metrics["fmax"]
             best_epoch = epoch
-            best_state_dict = copy.deepcopy(model.state_dict())
+            best_state_dict = state_dict_to_cpu(model.state_dict())
 
         history.append(
             {
@@ -412,9 +438,13 @@ def run_fold(args: SimpleNamespace, fold: int) -> dict:
             f"fmax={epoch_metrics['fmax']:.4f} @ {epoch_metrics['fmax_threshold']:.2f} | "
             f"lrs={', '.join(f'{name}={lr:.2e}' for name, lr in epoch_lrs.items())}"
         )
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     # Restore best epoch weights before final evaluation
     print(f"  Restoring best weights from epoch {best_epoch} (fmax={best_fmax:.4f})")
+    if best_state_dict is None:
+        raise RuntimeError(f"No best weights were recorded for fold {fold}. Check epochs={args.epochs}.")
     model.load_state_dict(best_state_dict)
 
     predictions = predict(model, val_loader, device, progress_desc=f"Fold {fold} Final Validation", use_amp=use_amp)
@@ -431,7 +461,7 @@ def run_fold(args: SimpleNamespace, fold: int) -> dict:
 
     serialized_args = serialize_value(vars(args))
     checkpoint = {
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": state_dict_to_cpu(model.state_dict()),
         "classes": fold_data.classes,
         "args": serialized_args,
         "config": serialized_args,
@@ -455,6 +485,10 @@ def run_fold(args: SimpleNamespace, fold: int) -> dict:
         payload=payload,
         classes=fold_data.classes,
     )
+    # Always save fold checkpoint for ensemble inference
+    fold_checkpoint_path = args.output_dir / f"{args.method}_{args.aspect}_fold{fold}.pt"
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(checkpoint, fold_checkpoint_path)
     if args.save_fold_artifacts:
         save_outputs(
             output_dir=args.output_dir,
@@ -544,21 +578,20 @@ def run_blast_fold(args: SimpleNamespace, fold: int) -> dict:
 
 def summarize_metrics(fold_results: List[dict]) -> dict:
     summary = {}
-    for key in ("micro_f1", "micro_precision", "micro_recall"):
+    for key in ("micro_f1", "micro_precision", "micro_recall", "fmax"):
         values = [result["metrics"][key] for result in fold_results]
         summary[f"avg_{key}"] = float(np.mean(values)) if values else 0.0
-    summary["best_fold"] = max(fold_results, key=lambda result: result["metrics"]["micro_f1"])["fold"]
+    summary["best_fold"] = max(fold_results, key=lambda result: result["metrics"]["fmax"])["fold"]
     return summary
 
 
-def save_best_result(args: SimpleNamespace, fold_results: List[dict], summary: dict) -> None:
-    best_result = max(fold_results, key=lambda result: result["metrics"]["micro_f1"])
+def save_best_result(args: SimpleNamespace, best_result: dict, summary: dict) -> None:
     best_prefix = f"best_{args.method}_{args.aspect}"
     best_output = {
         **best_result["payload"],
         "metrics": {
             **best_result["metrics"],
-            "selected_as_best_by": "micro_f1",
+            "selected_as_best_by": "fmax",
             "cv_summary": summary,
         },
     }
@@ -583,15 +616,27 @@ def run_training_job(config: dict) -> dict:
         print_device_summary(args.device)
 
     fold_results = []
+    best_result: dict | None = None
     for fold in args.fold:
         if args.method == "blast":
-            fold_results.append(run_blast_fold(args, fold))
+            result = run_blast_fold(args, fold)
+            fold_results.append({"fold": result["fold"], "metrics": result["metrics"]})
+            release_fold_result(result, args.device)
         else:
-            fold_results.append(run_fold(args, fold))
+            result = run_fold(args, fold)
+            fold_results.append({"fold": result["fold"], "metrics": result["metrics"]})
+            if best_result is None or result["metrics"]["fmax"] > best_result["metrics"]["fmax"]:
+                release_fold_result(best_result, args.device)
+                best_result = result
+            else:
+                release_fold_result(result, args.device)
 
     summary = summarize_metrics(fold_results)
     if args.method != "blast":
-        save_best_result(args, fold_results, summary)
+        if best_result is None:
+            raise RuntimeError("No fold result was available to save as the best model.")
+        save_best_result(args, best_result, summary)
+        release_fold_result(best_result, args.device)
     print("Summary:", json.dumps(summary, indent=2, sort_keys=True))
     return summary
 
