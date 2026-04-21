@@ -453,4 +453,7 @@ def collate_token_embedding_batch(batch):
     if stacked_protein_features is not None:
         batch_inputs["protein_features"] = stacked_protein_features
 
+    if protein_features[0] is not None:
+        batch_inputs["protein_features"] = torch.stack(list(protein_features), dim=0)
+
     return list(pids), batch_inputs, torch.stack(list(labels), dim=0)

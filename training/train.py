@@ -235,52 +235,14 @@ def build_optimizer(model: torch.nn.Module, args: SimpleNamespace) -> torch.opti
         raise RuntimeError(f"No trainable parameters found for method={args.method}")
 
     if args.method in {"esm2", "t5"}:
-        tracked_ids = set()
-        param_groups = []
-
-        if args.pooling == "attention" and hasattr(model, "pooler"):
-            attention_params = [parameter for parameter in model.pooler.parameters() if parameter.requires_grad]
-            if attention_params:
-                param_groups.append(
-                    {
-                        "params": attention_params,
-                        "lr": float(optimizer_config["attention_lr"]),
-                        "name": "attention",
-                    }
-                )
-                tracked_ids.update(id(parameter) for parameter in attention_params)
-
-        if hasattr(model, "head"):
-            classifier_params = [parameter for parameter in model.head.parameters() if parameter.requires_grad]
-            if classifier_params:
-                param_groups.append(
-                    {
-                        "params": classifier_params,
-                        "lr": float(optimizer_config["classifier_lr"]),
-                        "name": "classifier",
-                    }
-                )
-                tracked_ids.update(id(parameter) for parameter in classifier_params)
-
-        remaining_params = [
-            parameter
-            for parameter in model.parameters()
-            if parameter.requires_grad and id(parameter) not in tracked_ids
+        classifier_lr = float(optimizer_config["classifier_lr"])
+        param_groups = [
+            {
+                "params": trainable_params,
+                "lr": classifier_lr,
+                "name": "classifier",
+            }
         ]
-        if remaining_params:
-            fallback_lr = float(
-                optimizer_config.get(
-                    "classifier_lr",
-                    optimizer_config.get("attention_lr", optimizer_config.get("lr", 1e-3)),
-                )
-            )
-            param_groups.append(
-                {
-                    "params": remaining_params,
-                    "lr": fallback_lr,
-                    "name": "remaining",
-                }
-            )
     else:
         param_groups = [
             {

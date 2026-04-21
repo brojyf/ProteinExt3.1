@@ -54,6 +54,9 @@ class MLPHead(nn.Module):
         super().__init__()
         bottleneck = max(hidden_dim // 2, 1)
 
+        # Normalize raw input features of differing scales (PLM poolings + raw count features)
+        self.input_norm = nn.LayerNorm(input_dim)
+        
         # Project input to hidden_dim (also serves as residual shortcut)
         self.input_proj = nn.Linear(input_dim, hidden_dim)
 
@@ -78,7 +81,8 @@ class MLPHead(nn.Module):
         )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        x = self.input_proj(inputs)
+        x_norm = self.input_norm(inputs)
+        x = self.input_proj(x_norm)
         x = x + self.block1(x)
         return self.output_head(x)
 
