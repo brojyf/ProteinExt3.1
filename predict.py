@@ -67,6 +67,7 @@ class ProteinTokenInferenceDataset(Dataset):
         layer: str,
         hydro_window_size: int | None = None,
         include_protein_features: bool = False,
+        protein_features_cache: Dict[str, torch.Tensor] | None = None,
     ) -> None:
         self.pids = list(pids)
         self.sequences = sequences
@@ -75,7 +76,7 @@ class ProteinTokenInferenceDataset(Dataset):
         self.layer = layer
         self.hydro_window_size = hydro_window_size
         self.include_protein_features = include_protein_features
-        self._protein_feature_cache: Dict[str, torch.Tensor] = {}
+        self._protein_feature_cache: Dict[str, torch.Tensor] = protein_features_cache or {}
 
     def __len__(self) -> int:
         return len(self.pids)
@@ -496,10 +497,15 @@ def predict_for_method(
         classes = load_classes_for_checkpoint(models_dir, checkpoint_info, method, aspect)
 
     pids = sorted(sequences_by_pid)
+    protein_features_cache = {
+        pid: build_sequence_protein_features(seq)
+        for pid, seq in sequences_by_pid.items()
+    }
     dataset = ProteinTokenInferenceDataset(
         pids=pids,
         sequences=sequences_by_pid,
         embedding_dir=embedding_dir,
+        protein_features_cache=protein_features_cache,
         **dataset_kwargs_for_method(method, model_args),
     )
     loader_kwargs = {

@@ -24,7 +24,7 @@ def move_batch_to_device(batch_inputs: dict, device: torch.device) -> dict:
     moved = {}
     for key, value in batch_inputs.items():
         if isinstance(value, torch.Tensor):
-            moved[key] = value.to(device)
+            moved[key] = value.to(device, non_blocking=True)
         else:
             moved[key] = value
     return moved

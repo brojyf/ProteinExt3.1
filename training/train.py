@@ -120,7 +120,7 @@ def apply_cli_overrides(run_config: dict, cli_args: argparse.Namespace) -> dict:
     return resolved
 
 
-def build_datasets(args: SimpleNamespace, fold_data):
+def build_datasets(args: SimpleNamespace, fold_data, protein_features_cache=None):
     from training.data.data_utils import EMBEDDING_DIR, ProteinTokenEmbeddingDataset
     from training.data.embedding import DEFAULT_ESM2_INTERMEDIATE_LAYER, esm2_layer_dir
 
@@ -153,6 +153,7 @@ def build_datasets(args: SimpleNamespace, fold_data):
         sequences=fold_data.train_sequences,
         labels=fold_data.train_matrix,
         embedding_dir=EMBEDDING_DIR,
+        protein_features_cache=protein_features_cache,
         **dataset_kwargs,
     )
     val_dataset = ProteinTokenEmbeddingDataset(
@@ -160,15 +161,16 @@ def build_datasets(args: SimpleNamespace, fold_data):
         sequences=fold_data.val_sequences,
         labels=fold_data.val_matrix,
         embedding_dir=EMBEDDING_DIR,
+        protein_features_cache=protein_features_cache,
         **dataset_kwargs,
     )
     return train_dataset, val_dataset
 
 
-def build_loaders(args: SimpleNamespace, fold_data):
+def build_loaders(args: SimpleNamespace, fold_data, protein_features_cache=None):
     from training.data.data_utils import collate_token_embedding_batch
 
-    train_dataset, val_dataset = build_datasets(args, fold_data)
+    train_dataset, val_dataset = build_datasets(args, fold_data, protein_features_cache)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -328,7 +330,7 @@ def format_lrs(optimizer: torch.optim.Optimizer) -> str:
     return ", ".join(f"{name}={lr:.2e}" for name, lr in current_lrs(optimizer).items())
 
 
-def run_fold(args: SimpleNamespace, fold: int) -> dict:
+def run_fold(args: SimpleNamespace, fold: int, protein_features_cache=None) -> dict:
     from training.data.data_utils import load_fold_data
     from submethods import MODEL_BUILDERS
     from training.trainer import (
@@ -353,7 +355,9 @@ def run_fold(args: SimpleNamespace, fold: int) -> dict:
     asl_clip = float(getattr(args, "asl_clip", 0.05))
 
     model = MODEL_BUILDERS[args.method](args, num_classes=len(fold_data.classes)).to(device)
-    train_loader, val_loader = build_loaders(args, fold_data)
+    if device.type == "cuda":
+        model = torch.compile(model)
+    train_loader, val_loader = build_loaders(args, fold_data, protein_features_cache)
     optimizer = build_optimizer(model, args)
 
     # Scheduler counts optimizer steps, not raw batch steps
@@ -440,6 +444,8 @@ def run_fold(args: SimpleNamespace, fold: int) -> dict:
         )
         if device.type == "cuda":
             torch.cuda.empty_cache()
+        elif device.type == "mps":
+            torch.mps.empty_cache()
 
     # Restore best epoch weights before final evaluation
     print(f"  Restoring best weights from epoch {best_epoch} (fmax={best_fmax:.4f})")
@@ -608,12 +614,45 @@ def save_best_result(args: SimpleNamespace, best_result: dict, summary: dict) ->
         json.dump(summary, handle, indent=2, sort_keys=True)
 
 
+def _load_or_build_protein_features(folds) -> dict:
+    from training.data.data_utils import (
+        PROTEIN_FEATURES_DIR,
+        build_and_save_protein_features,
+        collect_unique_sequences_from_folds,
+        load_protein_features_cache,
+    )
+
+    features_path = PROTEIN_FEATURES_DIR / "protein_features.pt"
+    if features_path.exists():
+        print(f"Loading pre-computed protein features from {features_path}")
+        return load_protein_features_cache(features_path)
+
+    print("Pre-computing protein features for all training proteins ...")
+    sequences = collect_unique_sequences_from_folds(folds)
+    cache = build_and_save_protein_features(sequences, features_path)
+    print(f"  Saved {len(cache)} protein features to {features_path}")
+    return cache
+
+
+def _enable_cuda_optimizations() -> None:
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        print("CUDA optimizations enabled: TF32 matmul + cuDNN")
+
+
 def run_training_job(config: dict) -> dict:
     args = namespace_from_config(config)
     print()
     print(f"Training Job | method={args.method} | aspect={args.aspect}")
     if args.method != "blast":
         print_device_summary(args.device)
+        _enable_cuda_optimizations()
+
+    # Load pre-computed protein features once for all folds
+    protein_features_cache = None
+    if args.method != "blast":
+        protein_features_cache = _load_or_build_protein_features(args.fold)
 
     fold_results = []
     best_result: dict | None = None
@@ -623,7 +662,7 @@ def run_training_job(config: dict) -> dict:
             fold_results.append({"fold": result["fold"], "metrics": result["metrics"]})
             release_fold_result(result, args.device)
         else:
-            result = run_fold(args, fold)
+            result = run_fold(args, fold, protein_features_cache)
             fold_results.append({"fold": result["fold"], "metrics": result["metrics"]})
             if best_result is None or result["metrics"]["fmax"] > best_result["metrics"]["fmax"]:
                 release_fold_result(best_result, args.device)

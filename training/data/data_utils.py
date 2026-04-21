@@ -17,6 +17,7 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 TRAINING_DATA_DIR = ROOT_DIR / "training" / "data"
 FOLDS_DIR = TRAINING_DATA_DIR / "cv"
 EMBEDDING_DIR = TRAINING_DATA_DIR / "embedding"
+PROTEIN_FEATURES_DIR = TRAINING_DATA_DIR / "protein_features"
 
 
 @dataclass
@@ -318,6 +319,22 @@ def build_sequence_protein_features(sequence: str) -> torch.Tensor:
     return torch.tensor(features, dtype=torch.float32)
 
 
+def build_and_save_protein_features(
+    sequences_by_pid: Dict[str, str],
+    output_path: Path,
+) -> Dict[str, torch.Tensor]:
+    cache: Dict[str, torch.Tensor] = {}
+    for pid in sorted(sequences_by_pid):
+        cache[pid] = build_sequence_protein_features(sequences_by_pid[pid])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(cache, output_path)
+    return cache
+
+
+def load_protein_features_cache(path: Path) -> Dict[str, torch.Tensor]:
+    return torch.load(path, map_location="cpu", weights_only=True)
+
+
 def build_token_hydrophobicity_features(sequence: str, token_length: int, window_size: int) -> torch.Tensor:
     features = np.zeros((token_length, 2), dtype=np.float32)
     values = np.asarray([HYDRO_MAP.get(residue, 0.0) for residue in sequence], dtype=np.float32)
@@ -349,6 +366,7 @@ class ProteinTokenEmbeddingDataset(Dataset):
         layer: str,
         hydro_window_size: int | None = None,
         include_protein_features: bool = False,
+        protein_features_cache: Dict[str, torch.Tensor] | None = None,
     ) -> None:
         self.pids = list(pids)
         self.sequences = sequences
@@ -358,7 +376,7 @@ class ProteinTokenEmbeddingDataset(Dataset):
         self.layer = layer
         self.hydro_window_size = hydro_window_size
         self.include_protein_features = include_protein_features
-        self._protein_feature_cache: Dict[str, torch.Tensor] = {}
+        self._protein_feature_cache: Dict[str, torch.Tensor] = protein_features_cache or {}
 
     def __len__(self) -> int:
         return len(self.pids)
