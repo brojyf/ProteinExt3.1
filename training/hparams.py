@@ -70,16 +70,58 @@ METHOD_HPARAMS: Dict[str, Dict[str, object]] = {
 }
 
 
+# Per-method-per-aspect overrides.  P uses METHOD_HPARAMS defaults (dense labels,
+# ASL γ_neg=4 is fine).  F and C have sparser labels → lower γ_neg to prevent
+# all-negative collapse, higher go_term_loss_weight to optimise Fmax directly,
+# larger effective batch (gradient_accumulation) for rare-term coverage.
+
 TRAINING_RUNS: List[Dict[str, object]] = [
+    # ── ESM2 ──────────────────────────────────────────────────────────────
     {"method": "esm2", "aspect": "P"},
-    {"method": "esm2", "aspect": "F"},
-    {"method": "esm2", "aspect": "C"},
+    {"method": "esm2", "aspect": "F",
+     "hidden_dim": 768, "dropout": 0.3, "epochs": 30,
+     "asl_gamma_neg": 2.0, "asl_gamma_pos": 1.0, "asl_clip": 0.01,
+     "go_term_loss_weight": 0.5,
+     "gradient_accumulation_steps": 4,
+     "optimizer": {"classifier_lr": 3e-4}},
+    {"method": "esm2", "aspect": "C",
+     "hidden_dim": 768, "dropout": 0.35, "epochs": 28,
+     "asl_gamma_neg": 3.0, "asl_gamma_pos": 0.5, "asl_clip": 0.03,
+     "go_term_loss_weight": 0.35,
+     "gradient_accumulation_steps": 3,
+     "optimizer": {"classifier_lr": 3.5e-4}},
+
+    # ── ProtT5 ────────────────────────────────────────────────────────────
     {"method": "t5", "aspect": "P"},
-    {"method": "t5", "aspect": "F"},
-    {"method": "t5", "aspect": "C"},
+    {"method": "t5", "aspect": "F",
+     "hidden_dim": 768, "dropout": 0.3, "epochs": 30,
+     "asl_gamma_neg": 2.0, "asl_gamma_pos": 1.0, "asl_clip": 0.01,
+     "go_term_loss_weight": 0.5,
+     "gradient_accumulation_steps": 4,
+     "optimizer": {"classifier_lr": 2.5e-4}},
+    {"method": "t5", "aspect": "C",
+     "hidden_dim": 768, "dropout": 0.35, "epochs": 28,
+     "asl_gamma_neg": 3.0, "asl_gamma_pos": 0.5, "asl_clip": 0.03,
+     "go_term_loss_weight": 0.35,
+     "gradient_accumulation_steps": 3,
+     "optimizer": {"classifier_lr": 3e-4}},
+
+    # ── CNN ────────────────────────────────────────────────────────────────
     {"method": "cnn", "aspect": "P"},
-    {"method": "cnn", "aspect": "F"},
-    {"method": "cnn", "aspect": "C"},
+    {"method": "cnn", "aspect": "F",
+     "hidden_dim": 512, "cnn_hidden_dim": 512, "dropout": 0.25, "epochs": 25,
+     "asl_gamma_neg": 2.0, "asl_gamma_pos": 1.0, "asl_clip": 0.01,
+     "go_term_loss_weight": 0.5,
+     "gradient_accumulation_steps": 4,
+     "optimizer": {"lr": 4e-4}},
+    {"method": "cnn", "aspect": "C",
+     "hidden_dim": 512, "cnn_hidden_dim": 512, "dropout": 0.25, "epochs": 22,
+     "asl_gamma_neg": 3.0, "asl_gamma_pos": 0.5, "asl_clip": 0.03,
+     "go_term_loss_weight": 0.35,
+     "gradient_accumulation_steps": 3,
+     "optimizer": {"lr": 5e-4}},
+
+    # ── BLAST (no trainable params) ───────────────────────────────────────
     {"method": "blast", "aspect": "P"},
     {"method": "blast", "aspect": "F"},
     {"method": "blast", "aspect": "C"},

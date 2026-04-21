@@ -1,5 +1,7 @@
-# File System
+# Local Machine
 .DS_Store
+.claude
+AGENTS.md
 
 # Python Cache
 __pycache__/
@@ -18,7 +20,7 @@ data/embedding/*
 data/test.fasta
 
 # Models
-models/*
+models*
 !models/fusion_weights.csv
 
 # Predictions

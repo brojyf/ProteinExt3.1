@@ -203,7 +203,16 @@ def compute_go_term_soft_f1_loss(
 
     # 2*TP + FP + FN is mathematically equivalent to pred_pos + true_pos
     soft_f1_per_term = (2.0 * tp + eps) / (pred_pos + true_pos + eps)
-    go_term_soft_f1 = soft_f1_per_term.mean()
+
+    # Only average over terms that have at least one positive in the batch.
+    # Terms with zero positives penalize any positive prediction (soft_f1→0),
+    # pushing the model toward all-negative outputs (fmax → 0).
+    active = true_pos > 0
+    if active.any():
+        go_term_soft_f1 = soft_f1_per_term[active].mean()
+    else:
+        go_term_soft_f1 = soft_f1_per_term.new_ones(())
+
     go_term_loss = 1.0 - go_term_soft_f1
     return go_term_loss, go_term_soft_f1
 
