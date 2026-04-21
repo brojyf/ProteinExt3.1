@@ -271,7 +271,12 @@ def compute_multilabel_metrics(
     y_pred = y_prob >= threshold
     y_true_bool = y_true.astype(bool)
     total_true = y_true_bool.sum()
-    
+
+    # Per-protein positive label counts (threshold-independent)
+    true_pos_per_protein = y_true_bool.sum(axis=1)  # (N,)
+    has_label = true_pos_per_protein > 0
+
+    # Protein-centric Fmax (CAFA standard)
     best_f1 = 0.0
     best_threshold = threshold
     thresholds = np.linspace(0.01, 0.99, 99)
@@ -283,23 +288,35 @@ def compute_multilabel_metrics(
     )
     for candidate in progress:
         candidate_pred = y_prob >= candidate
-        tp = np.logical_and(candidate_pred, y_true_bool).sum()
-        pred_positives = candidate_pred.sum()
-        
-        # Math trick: 2*TP + FP + FN == pred_positives + total_true
-        denom = pred_positives + total_true
-        candidate_f1 = float((2 * tp) / denom) if denom > 0 else 0.0
-        
+        tp_per = np.logical_and(candidate_pred, y_true_bool).sum(axis=1)     # (N,)
+        pred_pos_per = candidate_pred.sum(axis=1)                             # (N,)
+
+        # Precision: only annotated proteins with predictions (CAFA standard —
+        # unannotated proteins' predictions are ignored, not counted as FP)
+        has_pred_and_label = (pred_pos_per > 0) & has_label
+        if has_pred_and_label.any():
+            avg_precision = float((tp_per[has_pred_and_label] / pred_pos_per[has_pred_and_label]).mean())
+        else:
+            avg_precision = 0.0
+
+        if has_label.any():
+            avg_recall = float((tp_per[has_label] / true_pos_per_protein[has_label]).mean())
+        else:
+            avg_recall = 0.0
+
+        denom = avg_precision + avg_recall
+        candidate_f1 = (2.0 * avg_precision * avg_recall) / denom if denom > 0 else 0.0
+
         if candidate_f1 > best_f1:
             best_f1 = candidate_f1
             best_threshold = float(candidate)
 
+    # Fixed-threshold micro metrics (for logging alongside fmax)
     tp_base = np.logical_and(y_pred, y_true_bool).sum()
     pred_positives_base = y_pred.sum()
 
     denom_f1 = pred_positives_base + total_true
     denom_p = pred_positives_base
-    # Recall denom = TP + FN = total_true
     denom_r = total_true
 
     return {
@@ -322,8 +339,15 @@ def evaluate_multilabel_metrics(
 ) -> Dict[str, float]:
     model.eval()
     thresholds = np.linspace(0.01, 0.99, 99)
-    threshold_tp = np.zeros(thresholds.shape[0], dtype=np.int64)
-    threshold_pred_positives = np.zeros(thresholds.shape[0], dtype=np.int64)
+    n_thresholds = len(thresholds)
+
+    # Protein-centric Fmax accumulators
+    precision_sum = np.zeros(n_thresholds, dtype=np.float64)
+    precision_count = np.zeros(n_thresholds, dtype=np.int64)
+    recall_sum = np.zeros(n_thresholds, dtype=np.float64)
+    recall_count = np.zeros(n_thresholds, dtype=np.int64)
+
+    # Fixed-threshold micro metrics
     total_true = 0
     base_tp = 0
     base_pred_positives = 0
@@ -347,19 +371,38 @@ def evaluate_multilabel_metrics(
         base_tp += int(np.logical_and(base_pred, labels_bool).sum())
         base_pred_positives += int(base_pred.sum())
 
-        for index, candidate in enumerate(thresholds):
-            candidate_pred = probs >= candidate
-            threshold_tp[index] += int(np.logical_and(candidate_pred, labels_bool).sum())
-            threshold_pred_positives[index] += int(candidate_pred.sum())
+        # Per-protein label counts (threshold-independent)
+        true_pos_per = labels_bool.sum(axis=1)    # (B,)
+        has_label = true_pos_per > 0
 
+        for t_idx, candidate in enumerate(thresholds):
+            candidate_pred = probs >= candidate
+            tp_per = np.logical_and(candidate_pred, labels_bool).sum(axis=1)   # (B,)
+            pred_pos_per = candidate_pred.sum(axis=1)                          # (B,)
+
+            # Precision: only annotated proteins with predictions (CAFA standard)
+            has_pred_and_label = (pred_pos_per > 0) & has_label
+            if has_pred_and_label.any():
+                prec_vals = tp_per[has_pred_and_label].astype(np.float64) / pred_pos_per[has_pred_and_label]
+                precision_sum[t_idx] += prec_vals.sum()
+                precision_count[t_idx] += int(has_pred_and_label.sum())
+
+            if has_label.any():
+                rec_vals = tp_per[has_label].astype(np.float64) / true_pos_per[has_label]
+                recall_sum[t_idx] += rec_vals.sum()
+                recall_count[t_idx] += int(has_label.sum())
+
+    # Protein-centric Fmax
     best_f1 = 0.0
     best_threshold = threshold
-    for candidate, tp, pred_positives in zip(thresholds, threshold_tp, threshold_pred_positives):
-        denom = int(pred_positives) + total_true
-        candidate_f1 = float((2 * int(tp)) / denom) if denom > 0 else 0.0
+    for t_idx in range(n_thresholds):
+        avg_p = precision_sum[t_idx] / precision_count[t_idx] if precision_count[t_idx] > 0 else 0.0
+        avg_r = recall_sum[t_idx] / recall_count[t_idx] if recall_count[t_idx] > 0 else 0.0
+        denom = avg_p + avg_r
+        candidate_f1 = (2.0 * avg_p * avg_r) / denom if denom > 0 else 0.0
         if candidate_f1 > best_f1:
             best_f1 = candidate_f1
-            best_threshold = float(candidate)
+            best_threshold = float(thresholds[t_idx])
 
     denom_f1 = base_pred_positives + total_true
     return {

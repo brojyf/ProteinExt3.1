@@ -20,10 +20,10 @@ COMMON_TRAINING_CONFIG: Dict[str, object] = {
     "use_amp": True,                     # Mixed precision (FP16) on CUDA
     "gradient_accumulation_steps": 2,    # Effective batch_size = batch_size * 2
     "focal_gamma": 0.0,                 # Focal loss γ; 0 = disabled (using ASL instead)
-    "asl_gamma_neg": 4.0,               # ASL negative focusing; 0 = disabled
+    "asl_gamma_neg": 3.0,               # ASL negative focusing (reduced from 4.0 for better calibration)
     "asl_gamma_pos": 0.0,               # ASL positive focusing; 0 = no down-weight on positives
     "asl_clip": 0.05,                   # ASL probability shifting for negatives
-    "label_smoothing": 0.0,              # Disabled; rely on ASL for class imbalance
+    "label_smoothing": 0.05,            # Mild smoothing to improve probability calibration
     "max_grad_norm": 1.0,               # Gradient clipping; 0 = disabled
     "scheduler": {
         "warmup_ratio": 0.08,
@@ -71,47 +71,62 @@ METHOD_HPARAMS: Dict[str, Dict[str, object]] = {
 
 TRAINING_RUNS: List[Dict[str, object]] = [
     # ── ESM2 ──────────────────────────────────────────────────────────────
-    {"method": "esm2", "aspect": "P"},
+    # P: dense labels, moderate ASL, higher go_term_loss to optimize protein-centric fmax
+    {"method": "esm2", "aspect": "P",
+     "asl_gamma_neg": 3.0, "asl_gamma_pos": 0.0, "asl_clip": 0.05,
+     "go_term_loss_weight": 0.30},
+    # F: sparse labels → gentle ASL, strong go_term_loss
     {"method": "esm2", "aspect": "F",
      "hidden_dim": 768, "dropout": 0.3, "epochs": 30,
      "asl_gamma_neg": 2.0, "asl_gamma_pos": 1.0, "asl_clip": 0.01,
-     "go_term_loss_weight": 0.5,
+     "go_term_loss_weight": 0.50,
      "gradient_accumulation_steps": 4,
      "optimizer": {"classifier_lr": 3e-4}},
+    # C: moderate sparsity → balanced ASL
     {"method": "esm2", "aspect": "C",
      "hidden_dim": 768, "dropout": 0.35, "epochs": 28,
-     "asl_gamma_neg": 3.0, "asl_gamma_pos": 0.5, "asl_clip": 0.03,
-     "go_term_loss_weight": 0.35,
+     "asl_gamma_neg": 2.5, "asl_gamma_pos": 0.5, "asl_clip": 0.03,
+     "go_term_loss_weight": 0.40,
      "gradient_accumulation_steps": 3,
      "optimizer": {"classifier_lr": 3.5e-4}},
 
     # ── ProtT5 ────────────────────────────────────────────────────────────
-    {"method": "t5", "aspect": "P"},
+    # P: dense labels, moderate ASL
+    {"method": "t5", "aspect": "P",
+     "asl_gamma_neg": 3.0, "asl_gamma_pos": 0.0, "asl_clip": 0.05,
+     "go_term_loss_weight": 0.25},
+    # F: sparse labels → gentle ASL, strong go_term_loss
     {"method": "t5", "aspect": "F",
      "hidden_dim": 768, "dropout": 0.3, "epochs": 30,
      "asl_gamma_neg": 2.0, "asl_gamma_pos": 1.0, "asl_clip": 0.01,
-     "go_term_loss_weight": 0.5,
+     "go_term_loss_weight": 0.50,
      "gradient_accumulation_steps": 4,
      "optimizer": {"classifier_lr": 2.5e-4}},
+    # C: moderate sparsity → balanced ASL
     {"method": "t5", "aspect": "C",
      "hidden_dim": 768, "dropout": 0.35, "epochs": 28,
-     "asl_gamma_neg": 3.0, "asl_gamma_pos": 0.5, "asl_clip": 0.03,
-     "go_term_loss_weight": 0.35,
+     "asl_gamma_neg": 2.5, "asl_gamma_pos": 0.5, "asl_clip": 0.03,
+     "go_term_loss_weight": 0.40,
      "gradient_accumulation_steps": 3,
      "optimizer": {"classifier_lr": 3e-4}},
 
     # ── CNN ────────────────────────────────────────────────────────────────
-    {"method": "cnn", "aspect": "P"},
+    # P: dense labels, moderate ASL
+    {"method": "cnn", "aspect": "P",
+     "asl_gamma_neg": 3.0, "asl_gamma_pos": 0.0, "asl_clip": 0.05,
+     "go_term_loss_weight": 0.20},
+    # F: sparse labels → gentle ASL, strong go_term_loss
     {"method": "cnn", "aspect": "F",
      "hidden_dim": 512, "cnn_hidden_dim": 512, "dropout": 0.25, "epochs": 25,
      "asl_gamma_neg": 2.0, "asl_gamma_pos": 1.0, "asl_clip": 0.01,
-     "go_term_loss_weight": 0.5,
+     "go_term_loss_weight": 0.50,
      "gradient_accumulation_steps": 4,
      "optimizer": {"lr": 4e-4}},
+    # C: moderate sparsity → balanced ASL
     {"method": "cnn", "aspect": "C",
      "hidden_dim": 512, "cnn_hidden_dim": 512, "dropout": 0.25, "epochs": 22,
-     "asl_gamma_neg": 3.0, "asl_gamma_pos": 0.5, "asl_clip": 0.03,
-     "go_term_loss_weight": 0.35,
+     "asl_gamma_neg": 2.5, "asl_gamma_pos": 0.5, "asl_clip": 0.03,
+     "go_term_loss_weight": 0.40,
      "gradient_accumulation_steps": 3,
      "optimizer": {"lr": 5e-4}},
 

@@ -399,15 +399,22 @@ def accumulate_threshold_counts_cuda(
     device_name: str,
     weight_batch_size: int,
     prop_pair_batch_size: int,
-) -> tuple[np.ndarray, np.ndarray, int]:
+) -> dict:
     import torch
 
     device = resolve_torch_device(device_name)
     n_samples = payload["labels"].shape[0]
+    n_weights = len(weights_grid)
     threshold_values = np.asarray(thresholds, dtype=np.float32)
-    true_positives = np.zeros((len(weights_grid), len(threshold_values)), dtype=np.int64)
+    n_thresholds = len(threshold_values)
+
+    true_positives = np.zeros((n_weights, n_thresholds), dtype=np.int64)
     pred_positives = np.zeros_like(true_positives)
     total_true = 0
+    precision_sum = np.zeros((n_weights, n_thresholds), dtype=np.float64)
+    precision_count = np.zeros((n_weights, n_thresholds), dtype=np.int64)
+    recall_sum = np.zeros((n_weights, n_thresholds), dtype=np.float64)
+    recall_count = np.zeros((n_weights, n_thresholds), dtype=np.int64)
 
     weight_array = np.asarray(
         [[weights[method] for method in methods] for weights in weights_grid],
@@ -424,6 +431,11 @@ def accumulate_threshold_counts_cuda(
         total_true += int(np.count_nonzero(labels_chunk))
         labels_t = torch.as_tensor(labels_chunk.astype(np.bool_, copy=False), device=device)
 
+        # Per-protein label counts for this chunk (threshold-independent)
+        true_pos_per_protein = labels_t.sum(dim=1)        # (rows,)
+        has_label = true_pos_per_protein > 0               # (rows,)
+        safe_true_pos = true_pos_per_protein.clamp(min=1).float()  # (rows,)
+
         method_tensors = [
             torch.as_tensor(np.asarray(payload["probs"][method][rows]), device=device, dtype=torch.float32)
             for method in methods
@@ -431,26 +443,52 @@ def accumulate_threshold_counts_cuda(
         method_stack = torch.stack(method_tensors, dim=0)
         labels_expanded = labels_t.unsqueeze(0)
 
-        for start in range(0, len(weights_grid), weight_batch_size):
-            end = min(start + weight_batch_size, len(weights_grid))
+        for start in range(0, n_weights, weight_batch_size):
+            end = min(start + weight_batch_size, n_weights)
             weights_t = torch.as_tensor(weight_array[start:end], device=device, dtype=torch.float32)
             fused = torch.einsum("mrc,bm->brc", method_stack, weights_t)
             propagate_scores_torch(fused, ancestor_t, child_t, prop_pair_batch_size)
 
             for threshold_idx, threshold in enumerate(thresholds_t):
-                pred = fused >= threshold
+                pred = fused >= threshold                          # (batch_W, rows, classes)
+                tp = pred & labels_expanded                        # (batch_W, rows, classes)
+
                 pred_positives[start:end, threshold_idx] += pred.sum(dim=(1, 2)).cpu().numpy()
-                true_positives[start:end, threshold_idx] += (pred & labels_expanded).sum(dim=(1, 2)).cpu().numpy()
+                true_positives[start:end, threshold_idx] += tp.sum(dim=(1, 2)).cpu().numpy()
+
+                # Per-protein stats for protein-centric fmax
+                tp_per = tp.sum(dim=2).float()                     # (batch_W, rows)
+                pred_pos_per = pred.sum(dim=2)                     # (batch_W, rows)
+
+                # Precision: only annotated proteins with predictions (CAFA standard)
+                has_pred_and_label = (pred_pos_per > 0) & has_label.unsqueeze(0)  # (batch_W, rows)
+                safe_pred_pos = pred_pos_per.clamp(min=1).float()
+                prec_per = (tp_per / safe_pred_pos) * has_pred_and_label.float()
+                precision_sum[start:end, threshold_idx] += prec_per.sum(dim=1).cpu().numpy()
+                precision_count[start:end, threshold_idx] += has_pred_and_label.sum(dim=1).cpu().numpy()
+
+                rec_per = (tp_per / safe_true_pos.unsqueeze(0)) * has_label.float().unsqueeze(0)
+                recall_sum[start:end, threshold_idx] += rec_per.sum(dim=1).cpu().numpy()
+                recall_count[start:end, threshold_idx] += int(has_label.sum().item())
 
             del fused, weights_t
 
         del labels_t, labels_expanded, method_stack, method_tensors
+        del true_pos_per_protein, has_label, safe_true_pos
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
         print(f"  {progress_label}: processed chunk {chunk_number} ({rows.stop}/{n_samples} rows)")
 
-    return true_positives, pred_positives, total_true
+    return {
+        "true_positives": true_positives,
+        "pred_positives": pred_positives,
+        "total_true": total_true,
+        "precision_sum": precision_sum,
+        "precision_count": precision_count,
+        "recall_sum": recall_sum,
+        "recall_count": recall_count,
+    }
 
 
 def accumulate_threshold_counts(
@@ -465,7 +503,7 @@ def accumulate_threshold_counts(
     device_name: str = "cpu",
     weight_batch_size: int = 1,
     prop_pair_batch_size: int = 20000,
-) -> tuple[np.ndarray, np.ndarray, int]:
+) -> dict:
     if device_name != "cpu":
         return accumulate_threshold_counts_cuda(
             payload,
@@ -481,33 +519,69 @@ def accumulate_threshold_counts(
         )
 
     n_samples = payload["labels"].shape[0]
+    n_weights = len(weights_grid)
     threshold_values = np.asarray(thresholds, dtype=np.float32)
-    true_positives = np.zeros((len(weights_grid), len(threshold_values)), dtype=np.int64)
+    n_thresholds = len(threshold_values)
+
+    true_positives = np.zeros((n_weights, n_thresholds), dtype=np.int64)
     pred_positives = np.zeros_like(true_positives)
     total_true = 0
+    # Protein-centric fmax accumulators
+    precision_sum = np.zeros((n_weights, n_thresholds), dtype=np.float64)
+    precision_count = np.zeros((n_weights, n_thresholds), dtype=np.int64)
+    recall_sum = np.zeros((n_weights, n_thresholds), dtype=np.float64)
+    recall_count = np.zeros((n_weights, n_thresholds), dtype=np.int64)
 
     for chunk_number, rows in enumerate(chunk_slices(n_samples, chunk_size), start=1):
         labels_chunk = np.array(payload["labels"][rows], dtype=np.int8, copy=True)
         propagate_scores_inplace(labels_chunk, prop_indices)
         total_true += int(np.count_nonzero(labels_chunk))
 
+        labels_bool = labels_chunk.astype(bool)
+        true_pos_per_protein = labels_bool.sum(axis=1)
+        has_label = true_pos_per_protein > 0
+
         method_chunks = {method: payload["probs"][method][rows] for method in methods}
         fused = np.empty(labels_chunk.shape, dtype=np.float32)
         temp = np.empty_like(fused)
         pred_mask = np.empty(labels_chunk.shape, dtype=bool)
+        tp_mask = np.empty(labels_chunk.shape, dtype=bool)
 
         for weight_idx, weights in enumerate(weights_grid):
             fuse_probability_chunk(method_chunks, methods, weights, fused, temp)
             propagate_scores_inplace(fused, prop_indices)
             for threshold_idx, threshold in enumerate(threshold_values):
                 np.greater_equal(fused, threshold, out=pred_mask)
+                np.logical_and(pred_mask, labels_bool, out=tp_mask)
+
                 pred_positives[weight_idx, threshold_idx] += int(np.count_nonzero(pred_mask))
-                np.logical_and(pred_mask, labels_chunk, out=pred_mask)
-                true_positives[weight_idx, threshold_idx] += int(np.count_nonzero(pred_mask))
+                true_positives[weight_idx, threshold_idx] += int(np.count_nonzero(tp_mask))
+
+                tp_per = tp_mask.sum(axis=1)
+                pred_pos_per = pred_mask.sum(axis=1)
+
+                has_pred_and_label = (pred_pos_per > 0) & has_label
+                if has_pred_and_label.any():
+                    prec_vals = tp_per[has_pred_and_label].astype(np.float64) / pred_pos_per[has_pred_and_label]
+                    precision_sum[weight_idx, threshold_idx] += float(prec_vals.sum())
+                    precision_count[weight_idx, threshold_idx] += int(has_pred_and_label.sum())
+
+                if has_label.any():
+                    rec_vals = tp_per[has_label].astype(np.float64) / true_pos_per_protein[has_label]
+                    recall_sum[weight_idx, threshold_idx] += float(rec_vals.sum())
+                    recall_count[weight_idx, threshold_idx] += int(has_label.sum())
 
         print(f"  {progress_label}: processed chunk {chunk_number} ({rows.stop}/{n_samples} rows)")
 
-    return true_positives, pred_positives, total_true
+    return {
+        "true_positives": true_positives,
+        "pred_positives": pred_positives,
+        "total_true": total_true,
+        "precision_sum": precision_sum,
+        "precision_count": precision_count,
+        "recall_sum": recall_sum,
+        "recall_count": recall_count,
+    }
 
 
 def metrics_from_counts(
@@ -558,7 +632,7 @@ def search_best_fusion(
             f"in chunks of {chunk_size} rows, {weight_batch_size} weights/batch..."
         )
 
-    true_positives, pred_positives, total_true = accumulate_threshold_counts(
+    stats = accumulate_threshold_counts(
         payload,
         methods,
         grid,
@@ -573,14 +647,16 @@ def search_best_fusion(
 
     best = None
     for weight_idx, weights in enumerate(grid):
-        # Find fmax (best F1 across all thresholds) for this weight combination
+        # Find fmax (best protein-centric F1 across all thresholds)
         weight_fmax = 0.0
         weight_best_threshold = float(thresholds[0])
         for threshold_idx, threshold in enumerate(thresholds):
-            tp = int(true_positives[weight_idx, threshold_idx])
-            pp = int(pred_positives[weight_idx, threshold_idx])
-            denom = pp + total_true
-            f1 = float((2 * tp) / denom) if denom > 0 else 0.0
+            pc = int(stats["precision_count"][weight_idx, threshold_idx])
+            rc = int(stats["recall_count"][weight_idx, threshold_idx])
+            avg_p = stats["precision_sum"][weight_idx, threshold_idx] / pc if pc > 0 else 0.0
+            avg_r = stats["recall_sum"][weight_idx, threshold_idx] / rc if rc > 0 else 0.0
+            denom = avg_p + avg_r
+            f1 = (2.0 * avg_p * avg_r) / denom if denom > 0 else 0.0
             if f1 > weight_fmax:
                 weight_fmax = f1
                 weight_best_threshold = float(threshold)
@@ -598,7 +674,7 @@ def search_best_fusion(
 
     fmax_thresholds = [round(float(value), 10) for value in np.linspace(0.01, 0.99, 99)]
     eval_thresholds = sorted(set(fmax_thresholds + [round(float(best["threshold"]), 10)]))
-    best_tp, best_pred, best_total_true = accumulate_threshold_counts(
+    best_stats = accumulate_threshold_counts(
         payload,
         methods,
         [best["weights"]],
@@ -613,20 +689,25 @@ def search_best_fusion(
     threshold_to_idx = {round(float(value), 10): idx for idx, value in enumerate(eval_thresholds)}
     selected_idx = threshold_to_idx[round(float(best["threshold"]), 10)]
 
+    # Protein-centric fmax over fine-grained thresholds
     fmax = 0.0
     fmax_threshold = float(best["threshold"])
     for threshold in fmax_thresholds:
         idx = threshold_to_idx[round(float(threshold), 10)]
-        denom = int(best_pred[0, idx]) + best_total_true
-        candidate_f1 = float((2 * int(best_tp[0, idx])) / denom) if denom > 0 else 0.0
+        pc = int(best_stats["precision_count"][0, idx])
+        rc = int(best_stats["recall_count"][0, idx])
+        avg_p = best_stats["precision_sum"][0, idx] / pc if pc > 0 else 0.0
+        avg_r = best_stats["recall_sum"][0, idx] / rc if rc > 0 else 0.0
+        denom = avg_p + avg_r
+        candidate_f1 = (2.0 * avg_p * avg_r) / denom if denom > 0 else 0.0
         if candidate_f1 > fmax:
             fmax = candidate_f1
             fmax_threshold = float(threshold)
 
     best["metrics"] = metrics_from_counts(
-        int(best_tp[0, selected_idx]),
-        int(best_pred[0, selected_idx]),
-        best_total_true,
+        int(best_stats["true_positives"][0, selected_idx]),
+        int(best_stats["pred_positives"][0, selected_idx]),
+        best_stats["total_true"],
         float(best["threshold"]),
         fmax=fmax,
         fmax_threshold=fmax_threshold,
