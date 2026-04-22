@@ -4,7 +4,7 @@
 
 ```bash
 # build cross validation files from raw data
-python training/data/make_cv.py --fasta training/data/raw/train.fasta --labels training/data/raw/labels.tsv --overwrite
+python training/data/make_cv.py --overwrite
 
 # optional: precompute embeddings; training/prediction also computes missing embeddings on demand
 python training/data/embedding.py --plm esm2 --batch-size 2
