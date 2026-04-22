@@ -48,7 +48,7 @@ DEFAULT_OBO_PATH = ROOT_DIR / "data" / "go-basic.obo"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train neural and BLAST GO predictors")
-    parser.add_argument("--method", choices=["esm2_last", "esm2_l20", "prott5", "blast", "esm2", "t5", "cnn"], default=None)
+    parser.add_argument("--method", choices=["esm2_last", "esm2_l20", "prott5", "blast", "esm2", "t5"], default=None)
     parser.add_argument("--aspect", choices=["P", "F", "C"], default=None)
     parser.add_argument("--fold", type=int, nargs="+", default=None)
     parser.add_argument("--epochs", type=int, default=None)
@@ -85,7 +85,7 @@ def apply_cli_overrides(config: Dict[str, object], args: argparse.Namespace) -> 
             resolved[key] = value
     if args.batch_size is not None:
         resolved["batch_size"] = args.batch_size
-    aliases = {"esm2": "esm2_last", "t5": "prott5", "cnn": "esm2_l20"}
+    aliases = {"esm2": "esm2_last", "t5": "prott5"}
     resolved["method"] = aliases.get(str(resolved["method"]), resolved["method"])
     return resolved
 

@@ -1,3 +1,0 @@
-from submethods.esm2_layer20_mlp import ESM2Layer20MLPClassifier, build_model
-
-ESM2Layer20CNNClassifier = ESM2Layer20MLPClassifier

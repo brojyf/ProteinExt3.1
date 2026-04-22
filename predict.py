@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Predict GO terms from protein FASTA")
     parser.add_argument("--in", dest="input", type=Path, default=ROOT_DIR / "data" / "test.fasta")
     parser.add_argument("--out", dest="output", type=Path, default=DEFAULT_OUTPUT_PATH)
-    parser.add_argument("--method", choices=["fusion", "esm2_last", "esm2_l20", "prott5", "blast", "esm2", "t5", "cnn"], default="fusion")
+    parser.add_argument("--method", choices=["fusion", "esm2_last", "esm2_l20", "prott5", "blast", "esm2", "t5"], default="fusion")
     parser.add_argument("--aspect", choices=["P", "F", "C", "PFC"], default="PFC")
     parser.add_argument("--batch-size", "--batchsize", dest="batch_size", type=int, default=2)
     parser.add_argument("--cpu", type=int, default=8)
@@ -94,7 +94,7 @@ def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device:
 
 
 def normalize_method(method: str) -> str:
-    return {"esm2": "esm2_last", "t5": "prott5", "cnn": "esm2_l20"}.get(method, method)
+    return {"esm2": "esm2_last", "t5": "prott5"}.get(method, method)
 
 
 def checkpoint_paths(method: str, aspect: str) -> List[Path]:

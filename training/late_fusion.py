@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def artifact_prefix(oof_dir: Path, method: str, aspect: str, fold: int) -> Path:
-    aliases = {"esm2": "esm2_last", "t5": "prott5", "cnn": "esm2_l20"}
+    aliases = {"esm2": "esm2_last", "t5": "prott5"}
     method = aliases.get(method, method)
     return oof_dir / f"{method}_{aspect}_fold_{fold}"
 
@@ -155,7 +155,7 @@ def main() -> None:
     parents = parse_go_obo(args.obo)
     rows = []
     summary: Dict[str, dict] = {}
-    aliases = {"esm2": "esm2_last", "t5": "prott5", "cnn": "esm2_l20"}
+    aliases = {"esm2": "esm2_last", "t5": "prott5"}
     methods = [aliases.get(method, method) for method in args.methods]
     required = {"esm2_last", "esm2_l20", "prott5", "blast"}
     if set(methods) != required:

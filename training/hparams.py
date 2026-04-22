@@ -139,7 +139,7 @@ TRAINING_RUNS: List[Dict[str, object]] = [
 def resolve_training_run(run_config: Dict[str, object]) -> Dict[str, object]:
     resolved = deepcopy(COMMON_TRAINING_CONFIG)
     resolved.update(deepcopy(run_config))
-    aliases = {"esm2": "esm2_last", "t5": "prott5", "cnn": "esm2_l20"}
+    aliases = {"esm2": "esm2_last", "t5": "prott5"}
     resolved["method"] = aliases.get(str(resolved["method"]), resolved["method"])
     return resolved
 
