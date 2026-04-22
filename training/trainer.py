@@ -63,14 +63,18 @@ def asymmetric_loss_with_logits(
     plus probability shifting on negatives to further suppress easy negatives.
     Designed for extreme label imbalance (95%+ negatives) typical in GO annotation.
     """
+    logits = logits.float()
+    labels = labels.float()
+    eps = torch.finfo(logits.dtype).eps
+
     probs = torch.sigmoid(logits)
 
     # Probability shifting: reduce negative probabilities to suppress easy negatives
     probs_neg = (probs - clip).clamp(min=0.0)
 
     # Separate positive and negative log-probabilities
-    log_pos = torch.log(probs.clamp(min=1e-8))
-    log_neg = torch.log((1.0 - probs_neg).clamp(min=1e-8))
+    log_pos = torch.log(probs.clamp(min=eps))
+    log_neg = torch.log((1.0 - probs_neg).clamp(min=eps))
 
     # Asymmetric focal weighting
     if gamma_pos > 0:
