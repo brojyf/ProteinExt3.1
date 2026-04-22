@@ -12,6 +12,7 @@ training/data/embedding
 training/data/raw
 training/oof
 training/data/protein_features
+training/data/label_space
 
 # Inference Data
 data/blast/*

@@ -172,28 +172,57 @@ def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Di
     )
     model = MODEL_BUILDERS[args.method](args, num_classes=len(fold_data.classes)).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=args.lr_factor,
+        patience=args.lr_patience,
+        min_lr=args.min_lr,
+    )
     best_state = None
     best_fmax = -1.0
     best_metrics = {}
+    best_epoch = 0
+    epochs_without_improvement = 0
     for epoch in range(1, args.epochs + 1):
+        epoch_lr = float(optimizer.param_groups[0]["lr"])
         result = train_one_epoch(model, train_loader, optimizer, args.device, f"fold {fold_data.fold_dir.name} epoch {epoch}")
         predictions = predict(model, val_loader, args.device, "validation")
         metrics = compute_multilabel_metrics(predictions["labels"], predictions["probs"], args.threshold)
-        print(f"fold={fold_data.fold_dir.name} epoch={epoch} loss={result.loss:.4f} fmax={metrics['fmax']:.4f}")
-        if metrics["fmax"] > best_fmax:
-            best_fmax = metrics["fmax"]
-            best_metrics = metrics
+        fmax = float(metrics["fmax"])
+        print(f"fold={fold_data.fold_dir.name} epoch={epoch} lr={epoch_lr:.2e} loss={result.loss:.4f} fmax={fmax:.4f}")
+        if fmax > best_fmax + args.early_stop_min_delta:
+            best_epoch = epoch
+            best_fmax = fmax
+            best_metrics = dict(metrics)
+            epochs_without_improvement = 0
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+        else:
+            epochs_without_improvement += 1
+        scheduler.step(fmax)
+        next_lr = float(optimizer.param_groups[0]["lr"])
+        if next_lr < epoch_lr:
+            print(f"fold={fold_data.fold_dir.name} epoch={epoch} reduce_lr={next_lr:.2e}")
+        if epochs_without_improvement >= args.early_stop_patience:
+            print(
+                f"fold={fold_data.fold_dir.name} early_stop epoch={epoch} "
+                f"best_epoch={best_epoch} best_fmax={best_fmax:.4f}"
+            )
+            break
     if best_state is None:
         raise RuntimeError("No checkpoint was produced; check epochs")
     model.load_state_dict(best_state)
     predictions = predict(model, val_loader, args.device, "final validation")
     metrics = compute_multilabel_metrics(predictions["labels"], predictions["probs"], args.threshold)
+    metrics = dict(metrics)
+    metrics["best_epoch"] = best_epoch
     checkpoint = {
         "model_state_dict": best_state,
         "classes": fold_data.classes,
         "args": vars(args).copy() | {"device": str(args.device), "output_dir": str(args.output_dir), "oof_dir": str(args.oof_dir)},
         "metrics": metrics,
+        "best_epoch": best_epoch,
+        "best_metrics": best_metrics,
         "aspect": args.aspect,
         "method": args.method,
     }
@@ -204,7 +233,7 @@ def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Di
         args.oof_dir / f"{args.method}_{args.aspect}_{fold_data.fold_dir.name}",
         predictions["pids"], predictions["labels"], predictions["probs"], fold_data.classes, metrics,
     )
-    return metrics if metrics["fmax"] >= best_metrics.get("fmax", -1) else best_metrics
+    return metrics
 
 
 def run_blast_fold(args: SimpleNamespace, fold_data) -> dict:
@@ -256,11 +285,11 @@ def run_training_job(config: Dict[str, object], obo_path: Path) -> dict:
 
 
 def main() -> None:
-    from training.hparams import get_training_runs, resolve_training_run
+    from training.hparams import get_training_runs, resolve_matching_training_run
 
     cli_args = parse_args()
     if cli_args.method or cli_args.aspect:
-        base = resolve_training_run({"method": cli_args.method or "esm2_last", "aspect": cli_args.aspect or "P"})
+        base = resolve_matching_training_run(cli_args.method or "esm2_last", cli_args.aspect or "P")
         run_training_job(apply_cli_overrides(base, cli_args), cli_args.obo)
         return
     for config in get_training_runs():
