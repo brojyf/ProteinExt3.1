@@ -106,12 +106,14 @@ def _embedding_exists(pid: str, plm: str, layer: str) -> bool:
 
 
 def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device: torch.device, method: str) -> None:
-    needs_esm2 = method in {"esm2_last", "esm2_l20"}
     needs_t5 = method == "prott5"
-    missing_esm2 = [
-        pid for pid in sequences_by_pid
-        if not (_embedding_exists(pid, "esm2", "last") and _embedding_exists(pid, "esm2", esm2_layer_dir(DEFAULT_ESM2_INTERMEDIATE_LAYER)))
-    ] if needs_esm2 else []
+    if method == "esm2_last":
+        missing_esm2 = [pid for pid in sequences_by_pid if not _embedding_exists(pid, "esm2", "last")]
+    elif method == "esm2_l20":
+        layer = esm2_layer_dir(DEFAULT_ESM2_INTERMEDIATE_LAYER)
+        missing_esm2 = [pid for pid in sequences_by_pid if not _embedding_exists(pid, "esm2", layer)]
+    else:
+        missing_esm2 = []
     missing_t5 = [pid for pid in sequences_by_pid if not _embedding_exists(pid, "t5", "last")] if needs_t5 else []
     if missing_esm2:
         extract_esm2_embeddings(
