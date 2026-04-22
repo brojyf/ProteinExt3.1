@@ -22,25 +22,45 @@ def move_batch_to_device(batch_inputs: dict, device: torch.device) -> dict:
     }
 
 
-def train_one_epoch(model, loader: DataLoader, optimizer, device: torch.device, progress_desc: str) -> EpochResult:
+def train_one_epoch(
+    model,
+    loader: DataLoader,
+    optimizer,
+    device: torch.device,
+    progress_desc: str,
+    scaler: torch.amp.GradScaler | None = None,
+    use_amp: bool = False,
+) -> EpochResult:
     model.train()
     total_loss = 0.0
     total_examples = 0
     for _, batch_inputs, labels in tqdm(loader, desc=progress_desc, leave=False, dynamic_ncols=True):
         batch_inputs = move_batch_to_device(batch_inputs, device)
-        labels = labels.to(device)
+        labels = labels.to(device, non_blocking=device.type == "cuda")
         optimizer.zero_grad(set_to_none=True)
-        logits = model(batch_inputs)
-        loss = F.binary_cross_entropy_with_logits(logits, labels)
-        loss.backward()
-        optimizer.step()
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            logits = model(batch_inputs)
+            loss = F.binary_cross_entropy_with_logits(logits, labels)
+        if scaler is None:
+            loss.backward()
+            optimizer.step()
+        else:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         total_loss += float(loss.item()) * labels.size(0)
         total_examples += labels.size(0)
     return EpochResult(loss=total_loss / max(total_examples, 1))
 
 
 @torch.inference_mode()
-def predict(model, loader: DataLoader, device: torch.device, progress_desc: str) -> Dict[str, np.ndarray]:
+def predict(
+    model,
+    loader: DataLoader,
+    device: torch.device,
+    progress_desc: str,
+    use_amp: bool = False,
+) -> Dict[str, np.ndarray]:
     model.eval()
     all_pids: List[str] = []
     all_probs: List[np.ndarray] = []
@@ -52,7 +72,9 @@ def predict(model, loader: DataLoader, device: torch.device, progress_desc: str)
         else:
             pids, batch_inputs = batch
         batch_inputs = move_batch_to_device(batch_inputs, device)
-        probs = torch.sigmoid(model(batch_inputs)).cpu().numpy()
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            logits = model(batch_inputs)
+        probs = torch.sigmoid(logits).cpu().numpy()
         all_pids.extend(pids)
         all_probs.append(probs)
     return {

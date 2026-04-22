@@ -164,14 +164,16 @@ def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Di
     )
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
-        collate_fn=collate_multi_embedding_batch,
+        collate_fn=collate_multi_embedding_batch, pin_memory=args.device.type == "cuda",
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size * 2, shuffle=False, num_workers=args.num_workers,
-        collate_fn=collate_multi_embedding_batch,
+        collate_fn=collate_multi_embedding_batch, pin_memory=args.device.type == "cuda",
     )
     model = MODEL_BUILDERS[args.method](args, num_classes=len(fold_data.classes)).to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    use_amp = args.device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="max",
@@ -186,11 +188,18 @@ def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Di
     epochs_without_improvement = 0
     for epoch in range(1, args.epochs + 1):
         epoch_lr = float(optimizer.param_groups[0]["lr"])
-        result = train_one_epoch(model, train_loader, optimizer, args.device, f"fold {fold_data.fold_dir.name} epoch {epoch}")
-        predictions = predict(model, val_loader, args.device, "validation")
+        result = train_one_epoch(
+            model, train_loader, optimizer, args.device, f"fold {fold_data.fold_dir.name} epoch {epoch}",
+            scaler=scaler, use_amp=use_amp,
+        )
+        predictions = predict(model, val_loader, args.device, "validation", use_amp=use_amp)
         metrics = compute_multilabel_metrics(predictions["labels"], predictions["probs"], args.threshold)
         fmax = float(metrics["fmax"])
-        print(f"fold={fold_data.fold_dir.name} epoch={epoch} lr={epoch_lr:.2e} loss={result.loss:.4f} fmax={fmax:.4f}")
+        print(
+            f"fold={fold_data.fold_dir.name} epoch={epoch} lr={epoch_lr:.2e} "
+            f"loss={result.loss:.4f} fmax={fmax:.4f} "
+            f"fmax_threshold={metrics['fmax_threshold']:.2f}"
+        )
         if fmax > best_fmax + args.early_stop_min_delta:
             best_epoch = epoch
             best_fmax = fmax
@@ -212,7 +221,7 @@ def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Di
     if best_state is None:
         raise RuntimeError("No checkpoint was produced; check epochs")
     model.load_state_dict(best_state)
-    predictions = predict(model, val_loader, args.device, "final validation")
+    predictions = predict(model, val_loader, args.device, "final validation", use_amp=use_amp)
     metrics = compute_multilabel_metrics(predictions["labels"], predictions["probs"], args.threshold)
     metrics = dict(metrics)
     metrics["best_epoch"] = best_epoch
@@ -254,7 +263,10 @@ def run_blast_fold(args: SimpleNamespace, fold_data) -> dict:
     labels = fold_data.val_matrix.toarray().astype(np.float32)
     metrics = compute_multilabel_metrics(labels, probs, args.threshold)
     save_oof(args.oof_dir / f"blast_{args.aspect}_{fold_data.fold_dir.name}", pids, labels, probs, fold_data.classes, metrics)
-    print(f"fold={fold_data.fold_dir.name} blast fmax={metrics['fmax']:.4f}")
+    print(
+        f"fold={fold_data.fold_dir.name} blast fmax={metrics['fmax']:.4f} "
+        f"fmax_threshold={metrics['fmax_threshold']:.2f}"
+    )
     return metrics
 
 
