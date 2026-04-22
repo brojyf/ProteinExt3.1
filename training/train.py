@@ -176,7 +176,12 @@ def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Di
         collate_fn=collate_multi_embedding_batch, pin_memory=args.device.type == "cuda",
     )
     model = MODEL_BUILDERS[args.method](args, num_classes=len(fold_data.classes)).to(args.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        model.parameters(), 
+        lr=args.lr, 
+        weight_decay=args.weight_decay,
+        fused=(args.device.type == "cuda")
+    )
     use_amp = args.device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     if args.lr_scheduler == "cosine":
