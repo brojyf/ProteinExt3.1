@@ -3,9 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import tempfile
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, List
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -14,831 +13,183 @@ if str(ROOT_DIR) not in sys.path:
 import numpy as np
 import pandas as pd
 
-from training.data.go_utils import build_propagation_indices, parse_go_obo
-
+from training.data.go_utils import build_propagation_indices, parse_go_obo, propagate_scores
+from training.trainer import compute_multilabel_metrics
 
 DEFAULT_OOF_DIR = ROOT_DIR / "training" / "oof"
-DEFAULT_OUTPUT_DIR = ROOT_DIR / "models"
+DEFAULT_OUTPUT = ROOT_DIR / "models" / "fusion_weights.csv"
 DEFAULT_OBO_PATH = ROOT_DIR / "data" / "go-basic.obo"
-DEFAULT_METHODS = ["esm2", "t5", "cnn", "blast"]
-METHOD_COLUMN_NAMES = {
-    "esm2": "W_ESM2",
-    "t5": "W_ProtT5",
-    "cnn": "W_PCACNN",
-    "blast": "W_BLAST",
-}
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Grid-search late fusion weights from OOF predictions")
+    parser = argparse.ArgumentParser(description="Search two-stage OOF fusion weights")
     parser.add_argument("--aspect", nargs="+", default=["P", "F", "C"], choices=["P", "F", "C"])
-    parser.add_argument("--methods", nargs="+", default=DEFAULT_METHODS, choices=DEFAULT_METHODS)
+    parser.add_argument("--methods", nargs="+", default=["esm2_last", "esm2_l20", "prott5", "blast"])
     parser.add_argument("--fold", type=int, nargs="+", default=[0, 1, 2, 3, 4])
     parser.add_argument("--oof-dir", type=Path, default=DEFAULT_OOF_DIR)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_DIR / "fusion_weights.csv",
-                        help="Exact file path to save the output CSV. A JSON summary will be saved alongside it.")
-    parser.add_argument("--weight-step", type=float, default=0.05)
-    parser.add_argument("--threshold-start", type=float, default=0.1)
-    parser.add_argument("--threshold-stop", type=float, default=0.9)
-    parser.add_argument("--threshold-step", type=float, default=0.05)
-    parser.add_argument("--save-fused-oof", action="store_true")
-    parser.add_argument("--obo", type=Path, default=DEFAULT_OBO_PATH,
-                        help="Path to go-basic.obo for propagation-aware Fmax (default: data/go-basic.obo)")
-    parser.add_argument("--cores", type=int, default=1,
-                        help="Kept for CLI compatibility; chunked fusion is single-process to cap RAM.")
-    parser.add_argument("--chunk-size", type=int, default=256,
-                        help="Number of proteins to evaluate per block (default: 256). Lower this if RAM is tight.")
-    parser.add_argument("--cache-dir", type=Path, default=None,
-                        help="Directory for temporary memmap files (default: <oof-dir>/.late_fusion_cache).")
-    parser.add_argument("--device", choices=["cpu", "cuda", "auto"], default="cpu",
-                        help="Device for grid search evaluation (default: cpu). Use cuda to enable GPU acceleration.")
-    parser.add_argument("--weight-batch-size", type=int, default=8,
-                        help="Number of weight candidates evaluated together on CUDA (default: 8).")
-    parser.add_argument("--prop-pair-batch-size", type=int, default=20000,
-                        help="Number of GO propagation ancestor/descendant pairs per CUDA scatter batch.")
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--obo", type=Path, default=DEFAULT_OBO_PATH)
+    parser.add_argument("--weight-step", "--alpha-step", dest="weight_step", type=float, default=0.05)
+    parser.add_argument("--cores", type=int, default=1, help="Accepted for README compatibility; not used.")
     return parser.parse_args()
 
 
-def fold_artifact_paths(oof_dir: Path, method: str, aspect: str, fold: int) -> dict:
-    prefix = oof_dir / f"{method}_{aspect}_fold{fold}"
-    return {
+def artifact_prefix(oof_dir: Path, method: str, aspect: str, fold: int) -> Path:
+    aliases = {"esm2": "esm2_last", "t5": "prott5", "cnn": "esm2_l20"}
+    method = aliases.get(method, method)
+    return oof_dir / f"{method}_{aspect}_fold_{fold}"
+
+
+def load_artifact(oof_dir: Path, method: str, aspect: str, fold: int) -> dict:
+    prefix = artifact_prefix(oof_dir, method, aspect, fold)
+    paths = {
         "pids": prefix.with_name(prefix.name + "_pids.npy"),
         "labels": prefix.with_name(prefix.name + "_labels.npy"),
         "probs": prefix.with_name(prefix.name + "_probs.npy"),
         "classes": prefix.with_name(prefix.name + "_classes.npy"),
     }
-
-
-def load_fold_artifact(
-    oof_dir: Path,
-    method: str,
-    aspect: str,
-    fold: int,
-    *,
-    mmap_arrays: bool = False,
-    metadata_only: bool = False,
-) -> dict:
-    required = fold_artifact_paths(oof_dir, method, aspect, fold)
-    missing = [name for name, path in required.items() if not path.exists()]
+    missing = [str(path) for path in paths.values() if not path.exists()]
     if missing:
-        missing_list = ", ".join(missing)
-        raise FileNotFoundError(f"Missing OOF artifacts for {method} {aspect} fold {fold}: {missing_list}")
-
-    artifact = {
-        "pids": np.load(required["pids"], allow_pickle=True),
-        "classes": np.load(required["classes"], allow_pickle=True),
-    }
-    if metadata_only:
-        return artifact
-
-    mmap_mode = "r" if mmap_arrays else None
-    artifact["labels"] = np.load(required["labels"], mmap_mode=mmap_mode)
-    artifact["probs"] = np.load(required["probs"], mmap_mode=mmap_mode)
-    return artifact
+        raise FileNotFoundError(f"Missing OOF artifacts: {missing}")
+    return {key: np.load(path, allow_pickle=True) for key, path in paths.items()}
 
 
-def align_artifact(reference: dict, candidate: dict, method: str, aspect: str, fold: int) -> np.ndarray:
-    if np.array_equal(reference["pids"], candidate["pids"]) and np.array_equal(reference["classes"], candidate["classes"]):
-        if not np.array_equal(reference["labels"], candidate["labels"]):
-            raise ValueError(f"Label mismatch for {method} {aspect} fold {fold}")
-        return candidate["probs"]
-
-    reference_pids = reference["pids"].tolist()
-    candidate_pid_to_index = {pid: index for index, pid in enumerate(candidate["pids"].tolist())}
-    try:
-        row_index = [candidate_pid_to_index[pid] for pid in reference_pids]
-    except KeyError as exc:
-        raise ValueError(f"PID mismatch for {method} {aspect} fold {fold}: missing {exc}") from exc
-
-    candidate_classes = candidate["classes"].tolist()
-    class_to_index = {term: index for index, term in enumerate(candidate_classes)}
-    try:
-        col_index = [class_to_index[term] for term in reference["classes"].tolist()]
-    except KeyError as exc:
-        raise ValueError(f"Class mismatch for {method} {aspect} fold {fold}: missing {exc}") from exc
-
-    aligned_probs = candidate["probs"][row_index][:, col_index]
-    aligned_labels = candidate["labels"][row_index][:, col_index]
-
-    if not np.array_equal(reference["labels"], aligned_labels):
-        raise ValueError(f"Label mismatch after alignment for {method} {aspect} fold {fold}")
-
-    return aligned_probs
+def align_to_reference(reference: dict, candidate: dict) -> np.ndarray:
+    pid_to_index = {pid: index for index, pid in enumerate(candidate["pids"].tolist())}
+    class_to_index = {term: index for index, term in enumerate(candidate["classes"].tolist())}
+    rows = [pid_to_index[pid] for pid in reference["pids"].tolist()]
+    aligned = np.zeros_like(reference["probs"], dtype=np.float32)
+    for out_col, term in enumerate(reference["classes"].tolist()):
+        in_col = class_to_index.get(term)
+        if in_col is not None:
+            aligned[:, out_col] = candidate["probs"][rows, in_col]
+    return aligned
 
 
-def is_identity_indices(indices: Sequence[int], size: int) -> bool:
-    return len(indices) == size and all(index == expected for expected, index in enumerate(indices))
-
-
-def assign_fold_block(target: np.ndarray, rows: slice, columns: List[int], values: np.ndarray) -> None:
-    if is_identity_indices(columns, target.shape[1]):
-        target[rows] = values
-    else:
-        target[rows, columns] = values
-
-
-def collect_oof_predictions(
-    oof_dir: Path,
-    methods: List[str],
-    aspect: str,
-    folds: List[int],
-    cache_dir: Path,
-) -> dict:
-    # First pass: load only small metadata, not multi-GB probability matrices.
-    union_classes_set = set()
-    total_samples = 0
+def collect_oof(oof_dir: Path, aspect: str, folds: List[int], methods: List[str]) -> dict:
+    pids = []
+    labels = []
+    probs = {method: [] for method in methods}
+    classes = None
     for fold in folds:
-        ref = load_fold_artifact(oof_dir, methods[0], aspect, fold, metadata_only=True)
-        union_classes_set.update(ref["classes"].tolist())
-        total_samples += len(ref["pids"])
-
-    classes = np.array(sorted(list(union_classes_set)))
-    class_to_idx = {term: i for i, term in enumerate(classes)}
-
-    n_samples = total_samples
-    n_classes = len(classes)
-
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    tmpdir = tempfile.TemporaryDirectory(prefix=f"late_fusion_{aspect}_", dir=cache_dir)
-    try:
-        tmp_path = Path(tmpdir.name)
-        stacked_pids = np.empty(n_samples, dtype=object)
-        stacked_labels = np.lib.format.open_memmap(
-            tmp_path / "labels.npy",
-            mode="w+",
-            dtype=np.int8,
-            shape=(n_samples, n_classes),
-        )
-        stacked_labels[:] = 0
-        stacked_probs = {
-            method: np.lib.format.open_memmap(
-                tmp_path / f"{method}_probs.npy",
-                mode="w+",
-                dtype=np.float16,
-                shape=(n_samples, n_classes),
-            )
-            for method in methods
-        }
-        for probs in stacked_probs.values():
-            probs[:] = 0.0
-
-        current_idx = 0
-        for fold in folds:
-            reference = load_fold_artifact(oof_dir, methods[0], aspect, fold, mmap_arrays=True)
-            n_fold_samples = len(reference["pids"])
-            ref_col_idx = [class_to_idx[term] for term in reference["classes"]]
-            fold_slice = slice(current_idx, current_idx + n_fold_samples)
-
-            print(f"  Caching fold {fold}: rows {current_idx}-{current_idx + n_fold_samples - 1}")
-            stacked_pids[fold_slice] = reference["pids"]
-            assign_fold_block(
-                stacked_labels,
-                fold_slice,
-                ref_col_idx,
-                reference["labels"].astype(np.int8, copy=False),
-            )
-            assign_fold_block(
-                stacked_probs[methods[0]],
-                fold_slice,
-                ref_col_idx,
-                reference["probs"].astype(np.float16, copy=False),
-            )
-
-            for method in methods[1:]:
-                candidate = load_fold_artifact(oof_dir, method, aspect, fold, mmap_arrays=True)
-                aligned_to_ref_probs = align_artifact(reference, candidate, method, aspect, fold)
-                assign_fold_block(
-                    stacked_probs[method],
-                    fold_slice,
-                    ref_col_idx,
-                    aligned_to_ref_probs.astype(np.float16, copy=False),
-                )
-
-            current_idx += n_fold_samples
-
-        stacked_labels.flush()
-        for probs in stacked_probs.values():
-            probs.flush()
-
-        return {
-            "pids": stacked_pids,
-            "labels": stacked_labels,
-            "classes": classes,
-            "probs": stacked_probs,
-            "_tmpdir": tmpdir,
-        }
-    except Exception:
-        tmpdir.cleanup()
-        raise
+        reference = load_artifact(oof_dir, methods[0], aspect, fold)
+        if classes is None:
+            classes = reference["classes"]
+        elif not np.array_equal(classes, reference["classes"]):
+            raise ValueError(f"Class mismatch on fold {fold}")
+        pids.append(reference["pids"])
+        labels.append(reference["labels"])
+        probs[methods[0]].append(reference["probs"].astype(np.float32))
+        for method in methods[1:]:
+            probs[method].append(align_to_reference(reference, load_artifact(oof_dir, method, aspect, fold)))
+    return {
+        "pids": np.concatenate(pids),
+        "labels": np.concatenate(labels),
+        "probs": {method: np.concatenate(values).astype(np.float32) for method, values in probs.items()},
+        "classes": classes,
+    }
 
 
-def calibrate_temperature(
-    probs: np.ndarray,
-    labels: np.ndarray,
-    chunk_size: int = 4096,
-) -> float:
-    """
-    Fit a single temperature parameter T that minimizes NLL on the given
-    labels. calibrated = sigmoid(logit(prob) / T).
-
-    Operates in chunks to avoid materialising full float64 copies of large
-    memmap arrays. Returns T >= 0.1.
-    """
-    from scipy.optimize import minimize_scalar
-
-    def nll_at_temperature(log_t: float) -> float:
-        t = np.exp(log_t)
-        total_nll = 0.0
-        n_total = 0
-        for start in range(0, probs.shape[0], chunk_size):
-            end = min(start + chunk_size, probs.shape[0])
-            p = np.asarray(probs[start:end], dtype=np.float64).clip(1e-7, 1.0 - 1e-7)
-            y = np.asarray(labels[start:end], dtype=np.float64)
-            logit_p = np.log(p / (1.0 - p))
-            scaled = 1.0 / (1.0 + np.exp(-logit_p / t))
-            nll = -(y * np.log(scaled + 1e-12) + (1.0 - y) * np.log(1.0 - scaled + 1e-12))
-            total_nll += float(nll.sum())
-            n_total += nll.size
-        return total_nll / max(n_total, 1)
-
-    result = minimize_scalar(nll_at_temperature, bounds=(np.log(0.1), np.log(10.0)), method="bounded")
-    return float(np.exp(result.x))
+def alpha_grid(step: float) -> List[float]:
+    count = int(round(1.0 / step))
+    return [round(index * step, 10) for index in range(count + 1)]
 
 
-def apply_temperature_inplace(probs: np.ndarray, temperature: float, chunk_size: int = 4096) -> None:
-    """Apply temperature scaling to a memmap probability array in-place."""
-    if abs(temperature - 1.0) < 1e-6:
-        return
-    for start in range(0, probs.shape[0], chunk_size):
-        end = min(start + chunk_size, probs.shape[0])
-        p = np.asarray(probs[start:end], dtype=np.float32).clip(1e-7, 1.0 - 1e-7)
-        logit_p = np.log(p / (1.0 - p))
-        calibrated = 1.0 / (1.0 + np.exp(-logit_p / temperature))
-        probs[start:end] = calibrated.astype(probs.dtype)
-    if hasattr(probs, "flush"):
-        probs.flush()
+def simplex_grid(methods: List[str], step: float) -> List[Dict[str, float]]:
+    units = int(round(1.0 / step))
 
-
-def generate_weight_grid(methods: List[str], step: float) -> Iterable[Dict[str, float]]:
-    units = round(1.0 / step)
-    if not np.isclose(units * step, 1.0):
-        raise ValueError(f"weight_step must evenly divide 1.0, got {step}")
-
-    def _simplex_points(n_remaining: int, units_remaining: int):
+    def points(n_remaining: int, units_remaining: int):
         if n_remaining == 1:
             yield (units_remaining,)
             return
         for first in range(units_remaining + 1):
-            for rest in _simplex_points(n_remaining - 1, units_remaining - first):
+            for rest in points(n_remaining - 1, units_remaining - first):
                 yield (first,) + rest
 
-    for point in _simplex_points(len(methods), units):
-        yield {method: round(v * step, 10) for method, v in zip(methods, point)}
+    return [
+        {method: round(value * step, 10) for method, value in zip(methods, point)}
+        for point in points(len(methods), units)
+    ]
 
 
-def generate_thresholds(start: float, stop: float, step: float) -> List[float]:
-    values = []
-    current = start
-    while current <= stop + 1e-9:
-        values.append(round(current, 10))
-        current += step
-    return values
-
-
-def chunk_slices(n_samples: int, chunk_size: int) -> Iterable[slice]:
-    for start in range(0, n_samples, chunk_size):
-        yield slice(start, min(start + chunk_size, n_samples))
-
-
-def propagate_scores_inplace(scores: np.ndarray, descendant_indices: List[List[int]]) -> np.ndarray:
-    for anc_idx, desc_idxs in enumerate(descendant_indices):
-        if desc_idxs:
-            np.maximum(
-                scores[:, anc_idx],
-                scores[:, desc_idxs].max(axis=1),
-                out=scores[:, anc_idx],
-            )
-    return scores
-
-
-def build_propagation_pairs(descendant_indices: List[List[int]]) -> tuple[np.ndarray, np.ndarray]:
-    ancestor_indices = []
-    child_indices = []
-    for anc_idx, desc_idxs in enumerate(descendant_indices):
-        ancestor_indices.extend([anc_idx] * len(desc_idxs))
-        child_indices.extend(desc_idxs)
-    return (
-        np.asarray(ancestor_indices, dtype=np.int64),
-        np.asarray(child_indices, dtype=np.int64),
-    )
-
-
-def fuse_probability_chunk(
-    method_chunks: Dict[str, np.ndarray],
-    methods: List[str],
-    weights: Dict[str, float],
-    out: np.ndarray,
-    temp: np.ndarray,
-) -> np.ndarray:
-    out.fill(0.0)
-    wrote_first = False
-    for method in methods:
-        weight = float(weights[method])
-        if weight == 0.0:
+def weighted_sum(probs_by_method: Dict[str, np.ndarray], weights: Dict[str, float]) -> np.ndarray:
+    result = None
+    for method, weight in weights.items():
+        if weight == 0:
             continue
-        source = method_chunks[method]
-        if not wrote_first:
-            np.multiply(source, weight, out=out, casting="unsafe")
-            wrote_first = True
-        else:
-            np.multiply(source, weight, out=temp, casting="unsafe")
-            np.add(out, temp, out=out)
-    return out
+        contribution = float(weight) * probs_by_method[method]
+        result = contribution.copy() if result is None else result + contribution
+    if result is None:
+        first = next(iter(probs_by_method.values()))
+        return np.zeros_like(first, dtype=np.float32)
+    return result.astype(np.float32)
 
 
-def resolve_torch_device(device_name: str):
-    import torch
-
-    if device_name == "auto":
-        device_name = "cuda" if torch.cuda.is_available() else "cpu"
-    if device_name == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("--device cuda was requested, but torch.cuda.is_available() is false")
-    return torch.device(device_name)
-
-
-def propagate_scores_torch(
-    scores,
-    ancestor_indices,
-    child_indices,
-    pair_batch_size: int,
-):
-    if ancestor_indices.numel() == 0:
-        return scores
-
-    source = scores.clone()
-    batch_size, rows, _ = scores.shape
-    for start in range(0, ancestor_indices.numel(), pair_batch_size):
-        end = min(start + pair_batch_size, ancestor_indices.numel())
-        ancestors = ancestor_indices[start:end]
-        children = child_indices[start:end]
-        child_scores = source.index_select(2, children)
-        scatter_index = ancestors.view(1, 1, -1).expand(batch_size, rows, -1)
-        scores.scatter_reduce_(2, scatter_index, child_scores, reduce="amax", include_self=True)
-    return scores
-
-
-def accumulate_threshold_counts_cuda(
-    payload: dict,
-    methods: List[str],
-    weights_grid: List[Dict[str, float]],
-    thresholds: Sequence[float],
-    prop_indices: List[List[int]],
-    chunk_size: int,
-    *,
-    progress_label: str,
-    device_name: str,
-    weight_batch_size: int,
-    prop_pair_batch_size: int,
-) -> dict:
-    import torch
-
-    device = resolve_torch_device(device_name)
-    n_samples = payload["labels"].shape[0]
-    n_weights = len(weights_grid)
-    threshold_values = np.asarray(thresholds, dtype=np.float32)
-    n_thresholds = len(threshold_values)
-
-    true_positives = np.zeros((n_weights, n_thresholds), dtype=np.int64)
-    pred_positives = np.zeros_like(true_positives)
-    total_true = 0
-    precision_sum = np.zeros((n_weights, n_thresholds), dtype=np.float64)
-    precision_count = np.zeros((n_weights, n_thresholds), dtype=np.int64)
-    recall_sum = np.zeros((n_weights, n_thresholds), dtype=np.float64)
-    recall_count = np.zeros((n_weights, n_thresholds), dtype=np.int64)
-
-    weight_array = np.asarray(
-        [[weights[method] for method in methods] for weights in weights_grid],
-        dtype=np.float32,
-    )
-    thresholds_t = torch.as_tensor(threshold_values, device=device, dtype=torch.float32)
-    ancestor_np, child_np = build_propagation_pairs(prop_indices)
-    ancestor_t = torch.as_tensor(ancestor_np, device=device, dtype=torch.long)
-    child_t = torch.as_tensor(child_np, device=device, dtype=torch.long)
-
-    for chunk_number, rows in enumerate(chunk_slices(n_samples, chunk_size), start=1):
-        labels_chunk = np.array(payload["labels"][rows], dtype=np.int8, copy=True)
-        propagate_scores_inplace(labels_chunk, prop_indices)
-        total_true += int(np.count_nonzero(labels_chunk))
-        labels_t = torch.as_tensor(labels_chunk.astype(np.bool_, copy=False), device=device)
-
-        # Per-protein label counts for this chunk (threshold-independent)
-        true_pos_per_protein = labels_t.sum(dim=1)        # (rows,)
-        has_label = true_pos_per_protein > 0               # (rows,)
-        safe_true_pos = true_pos_per_protein.clamp(min=1).float()  # (rows,)
-
-        method_tensors = [
-            torch.as_tensor(np.asarray(payload["probs"][method][rows]), device=device, dtype=torch.float32)
-            for method in methods
-        ]
-        method_stack = torch.stack(method_tensors, dim=0)
-        labels_expanded = labels_t.unsqueeze(0)
-
-        for start in range(0, n_weights, weight_batch_size):
-            end = min(start + weight_batch_size, n_weights)
-            weights_t = torch.as_tensor(weight_array[start:end], device=device, dtype=torch.float32)
-            fused = torch.einsum("mrc,bm->brc", method_stack, weights_t)
-            propagate_scores_torch(fused, ancestor_t, child_t, prop_pair_batch_size)
-
-            for threshold_idx, threshold in enumerate(thresholds_t):
-                pred = fused >= threshold                          # (batch_W, rows, classes)
-                tp = pred & labels_expanded                        # (batch_W, rows, classes)
-
-                pred_positives[start:end, threshold_idx] += pred.sum(dim=(1, 2)).cpu().numpy()
-                true_positives[start:end, threshold_idx] += tp.sum(dim=(1, 2)).cpu().numpy()
-
-                # Per-protein stats for protein-centric fmax
-                tp_per = tp.sum(dim=2).float()                     # (batch_W, rows)
-                pred_pos_per = pred.sum(dim=2)                     # (batch_W, rows)
-
-                # Precision: only annotated proteins with predictions (CAFA standard)
-                has_pred_and_label = (pred_pos_per > 0) & has_label.unsqueeze(0)  # (batch_W, rows)
-                safe_pred_pos = pred_pos_per.clamp(min=1).float()
-                prec_per = (tp_per / safe_pred_pos) * has_pred_and_label.float()
-                precision_sum[start:end, threshold_idx] += prec_per.sum(dim=1).cpu().numpy()
-                precision_count[start:end, threshold_idx] += has_pred_and_label.sum(dim=1).cpu().numpy()
-
-                rec_per = (tp_per / safe_true_pos.unsqueeze(0)) * has_label.float().unsqueeze(0)
-                recall_sum[start:end, threshold_idx] += rec_per.sum(dim=1).cpu().numpy()
-                recall_count[start:end, threshold_idx] += int(has_label.sum().item())
-
-            del fused, weights_t
-
-        del labels_t, labels_expanded, method_stack, method_tensors
-        del true_pos_per_protein, has_label, safe_true_pos
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
-        print(f"  {progress_label}: processed chunk {chunk_number} ({rows.stop}/{n_samples} rows)")
-
-    return {
-        "true_positives": true_positives,
-        "pred_positives": pred_positives,
-        "total_true": total_true,
-        "precision_sum": precision_sum,
-        "precision_count": precision_count,
-        "recall_sum": recall_sum,
-        "recall_count": recall_count,
-    }
-
-
-def accumulate_threshold_counts(
-    payload: dict,
-    methods: List[str],
-    weights_grid: List[Dict[str, float]],
-    thresholds: Sequence[float],
-    prop_indices: List[List[int]],
-    chunk_size: int,
-    *,
-    progress_label: str,
-    device_name: str = "cpu",
-    weight_batch_size: int = 1,
-    prop_pair_batch_size: int = 20000,
-) -> dict:
-    if device_name != "cpu":
-        return accumulate_threshold_counts_cuda(
-            payload,
-            methods,
-            weights_grid,
-            thresholds,
-            prop_indices,
-            chunk_size,
-            progress_label=progress_label,
-            device_name=device_name,
-            weight_batch_size=weight_batch_size,
-            prop_pair_batch_size=prop_pair_batch_size,
-        )
-
-    n_samples = payload["labels"].shape[0]
-    n_weights = len(weights_grid)
-    threshold_values = np.asarray(thresholds, dtype=np.float32)
-    n_thresholds = len(threshold_values)
-
-    true_positives = np.zeros((n_weights, n_thresholds), dtype=np.int64)
-    pred_positives = np.zeros_like(true_positives)
-    total_true = 0
-    # Protein-centric fmax accumulators
-    precision_sum = np.zeros((n_weights, n_thresholds), dtype=np.float64)
-    precision_count = np.zeros((n_weights, n_thresholds), dtype=np.int64)
-    recall_sum = np.zeros((n_weights, n_thresholds), dtype=np.float64)
-    recall_count = np.zeros((n_weights, n_thresholds), dtype=np.int64)
-
-    for chunk_number, rows in enumerate(chunk_slices(n_samples, chunk_size), start=1):
-        labels_chunk = np.array(payload["labels"][rows], dtype=np.int8, copy=True)
-        propagate_scores_inplace(labels_chunk, prop_indices)
-        total_true += int(np.count_nonzero(labels_chunk))
-
-        labels_bool = labels_chunk.astype(bool)
-        true_pos_per_protein = labels_bool.sum(axis=1)
-        has_label = true_pos_per_protein > 0
-
-        method_chunks = {method: payload["probs"][method][rows] for method in methods}
-        fused = np.empty(labels_chunk.shape, dtype=np.float32)
-        temp = np.empty_like(fused)
-        pred_mask = np.empty(labels_chunk.shape, dtype=bool)
-        tp_mask = np.empty(labels_chunk.shape, dtype=bool)
-
-        for weight_idx, weights in enumerate(weights_grid):
-            fuse_probability_chunk(method_chunks, methods, weights, fused, temp)
-            propagate_scores_inplace(fused, prop_indices)
-            for threshold_idx, threshold in enumerate(threshold_values):
-                np.greater_equal(fused, threshold, out=pred_mask)
-                np.logical_and(pred_mask, labels_bool, out=tp_mask)
-
-                pred_positives[weight_idx, threshold_idx] += int(np.count_nonzero(pred_mask))
-                true_positives[weight_idx, threshold_idx] += int(np.count_nonzero(tp_mask))
-
-                tp_per = tp_mask.sum(axis=1)
-                pred_pos_per = pred_mask.sum(axis=1)
-
-                has_pred_and_label = (pred_pos_per > 0) & has_label
-                if has_pred_and_label.any():
-                    prec_vals = tp_per[has_pred_and_label].astype(np.float64) / pred_pos_per[has_pred_and_label]
-                    precision_sum[weight_idx, threshold_idx] += float(prec_vals.sum())
-                    precision_count[weight_idx, threshold_idx] += int(has_pred_and_label.sum())
-
-                if has_label.any():
-                    rec_vals = tp_per[has_label].astype(np.float64) / true_pos_per_protein[has_label]
-                    recall_sum[weight_idx, threshold_idx] += float(rec_vals.sum())
-                    recall_count[weight_idx, threshold_idx] += int(has_label.sum())
-
-        print(f"  {progress_label}: processed chunk {chunk_number} ({rows.stop}/{n_samples} rows)")
-
-    return {
-        "true_positives": true_positives,
-        "pred_positives": pred_positives,
-        "total_true": total_true,
-        "precision_sum": precision_sum,
-        "precision_count": precision_count,
-        "recall_sum": recall_sum,
-        "recall_count": recall_count,
-    }
-
-
-def metrics_from_counts(
-    true_positives: int,
-    pred_positives: int,
-    total_true: int,
-    threshold: float,
-    *,
-    fmax: float = 0.0,
-    fmax_threshold: float | None = None,
-) -> Dict[str, float]:
-    denom_f1 = pred_positives + total_true
-    return {
-        "micro_f1": float((2 * true_positives) / denom_f1) if denom_f1 > 0 else 0.0,
-        "micro_precision": float(true_positives / pred_positives) if pred_positives > 0 else 0.0,
-        "micro_recall": float(true_positives / total_true) if total_true > 0 else 0.0,
-        "fmax": float(fmax),
-        "fmax_threshold": float(threshold if fmax_threshold is None else fmax_threshold),
-    }
-
-
-def search_best_fusion(
-    payload: dict,
-    methods: List[str],
-    thresholds: List[float],
-    weight_step: float,
-    prop_indices: List[List[int]],
-    chunk_size: int,
-    cores: int = 1,
-    device_name: str = "cpu",
-    weight_batch_size: int = 1,
-    prop_pair_batch_size: int = 20000,
-) -> dict:
-    """
-    Grid-search fusion weights with bounded RAM.
-
-    The evaluator streams row blocks from memmapped OOF predictions. It keeps
-    only one fused block, one temp block, and one boolean mask in memory.
-    """
-    if cores != 1 and device_name == "cpu":
-        print("  Note: chunked fusion ignores --cores to avoid parallel copies of large matrices.")
-    grid = list(generate_weight_grid(methods, weight_step))
-    if device_name == "cpu":
-        print(f"  Evaluating {len(grid)} fusion candidates in chunks of {chunk_size} rows...")
-    else:
-        print(
-            f"  Evaluating {len(grid)} fusion candidates on {device_name} "
-            f"in chunks of {chunk_size} rows, {weight_batch_size} weights/batch..."
-        )
-
-    stats = accumulate_threshold_counts(
-        payload,
-        methods,
-        grid,
-        thresholds,
-        prop_indices,
-        chunk_size,
-        progress_label="Grid search",
-        device_name=device_name,
-        weight_batch_size=weight_batch_size,
-        prop_pair_batch_size=prop_pair_batch_size,
-    )
-
-    best = None
-    for weight_idx, weights in enumerate(grid):
-        # Find fmax (best protein-centric F1 across all thresholds)
-        weight_fmax = 0.0
-        weight_best_threshold = float(thresholds[0])
-        for threshold_idx, threshold in enumerate(thresholds):
-            pc = int(stats["precision_count"][weight_idx, threshold_idx])
-            rc = int(stats["recall_count"][weight_idx, threshold_idx])
-            avg_p = stats["precision_sum"][weight_idx, threshold_idx] / pc if pc > 0 else 0.0
-            avg_r = stats["recall_sum"][weight_idx, threshold_idx] / rc if rc > 0 else 0.0
-            denom = avg_p + avg_r
-            f1 = (2.0 * avg_p * avg_r) / denom if denom > 0 else 0.0
-            if f1 > weight_fmax:
-                weight_fmax = f1
-                weight_best_threshold = float(threshold)
-
-        candidate = {
-            "weights": weights,
-            "threshold": weight_best_threshold,
-            "metrics": {"fmax": weight_fmax},
-        }
-        if best is None or weight_fmax > best["metrics"]["fmax"]:
-            best = candidate
-
-    if best is None:
-        raise RuntimeError("No fusion candidates were evaluated")
-
-    fmax_thresholds = [round(float(value), 10) for value in np.linspace(0.01, 0.99, 99)]
-    eval_thresholds = sorted(set(fmax_thresholds + [round(float(best["threshold"]), 10)]))
-    best_stats = accumulate_threshold_counts(
-        payload,
-        methods,
-        [best["weights"]],
-        eval_thresholds,
-        prop_indices,
-        chunk_size,
-        progress_label="Best-weight Fmax",
-        device_name=device_name,
-        weight_batch_size=1,
-        prop_pair_batch_size=prop_pair_batch_size,
-    )
-    threshold_to_idx = {round(float(value), 10): idx for idx, value in enumerate(eval_thresholds)}
-    selected_idx = threshold_to_idx[round(float(best["threshold"]), 10)]
-
-    # Protein-centric fmax over fine-grained thresholds
-    fmax = 0.0
-    fmax_threshold = float(best["threshold"])
-    for threshold in fmax_thresholds:
-        idx = threshold_to_idx[round(float(threshold), 10)]
-        pc = int(best_stats["precision_count"][0, idx])
-        rc = int(best_stats["recall_count"][0, idx])
-        avg_p = best_stats["precision_sum"][0, idx] / pc if pc > 0 else 0.0
-        avg_r = best_stats["recall_sum"][0, idx] / rc if rc > 0 else 0.0
-        denom = avg_p + avg_r
-        candidate_f1 = (2.0 * avg_p * avg_r) / denom if denom > 0 else 0.0
-        if candidate_f1 > fmax:
-            fmax = candidate_f1
-            fmax_threshold = float(threshold)
-
-    best["metrics"] = metrics_from_counts(
-        int(best_stats["true_positives"][0, selected_idx]),
-        int(best_stats["pred_positives"][0, selected_idx]),
-        best_stats["total_true"],
-        float(best["threshold"]),
-        fmax=fmax,
-        fmax_threshold=fmax_threshold,
-    )
-
-    return best
-
-
-def format_weight_row(aspect: str, best: dict) -> dict:
-    row = {"Aspect": aspect}
-    for method, column_name in METHOD_COLUMN_NAMES.items():
-        row[column_name] = float(best["weights"].get(method, 0.0))
-    row["THRESHOLD"] = float(best["threshold"])
-    row["F1"] = float(best["metrics"]["micro_f1"])
-    row["MICRO_PRECISION"] = float(best["metrics"]["micro_precision"])
-    row["MICRO_RECALL"] = float(best["metrics"]["micro_recall"])
-    return row
-
-
-def save_fused_oof(
-    output_dir: Path,
-    aspect: str,
-    payload: dict,
-    methods: List[str],
-    best: dict,
-    chunk_size: int,
-) -> None:
-    prefix = output_dir / f"late_fusion_{aspect}"
-    np.save(prefix.with_name(prefix.name + "_pids.npy"), payload["pids"])
-    np.save(prefix.with_name(prefix.name + "_labels.npy"), payload["labels"])
-    np.save(prefix.with_name(prefix.name + "_classes.npy"), payload["classes"])
-    probs_path = prefix.with_name(prefix.name + "_probs.npy")
-    fused_out = np.lib.format.open_memmap(
-        probs_path,
-        mode="w+",
-        dtype=np.float32,
-        shape=payload["labels"].shape,
-    )
-    for rows in chunk_slices(payload["labels"].shape[0], chunk_size):
-        method_chunks = {method: payload["probs"][method][rows] for method in methods}
-        fused = np.empty((rows.stop - rows.start, payload["labels"].shape[1]), dtype=np.float32)
-        temp = np.empty_like(fused)
-        fuse_probability_chunk(method_chunks, methods, best["weights"], fused, temp)
-        fused_out[rows] = fused
-    fused_out.flush()
+def search_two_stage_fusion(payload: dict, parents: dict, step: float) -> dict:
+    prop_indices = build_propagation_indices(payload["classes"], parents)
+    labels = propagate_scores(payload["labels"].astype(np.float32), prop_indices)
+    chain_methods = ["esm2_last", "esm2_l20", "prott5"]
+    best_neural = None
+    for weights in simplex_grid(chain_methods, step):
+        fused = weighted_sum(payload["probs"], weights)
+        fused = propagate_scores(fused, prop_indices)
+        metrics = compute_multilabel_metrics(labels, fused)
+        candidate = {"weights": weights, "metrics": metrics, "probs": fused}
+        if best_neural is None or metrics["fmax"] > best_neural["metrics"]["fmax"]:
+            best_neural = candidate
+    if best_neural is None:
+        raise RuntimeError("No neural fusion candidate was evaluated")
+    best_final = None
+    for beta in alpha_grid(step):
+        fused = beta * best_neural["probs"] + (1.0 - beta) * payload["probs"]["blast"]
+        fused = propagate_scores(fused, prop_indices)
+        metrics = compute_multilabel_metrics(labels, fused)
+        candidate = {"beta": beta, "metrics": metrics}
+        if best_final is None or metrics["fmax"] > best_final["metrics"]["fmax"]:
+            best_final = candidate
+    return {"neural": best_neural, "final": best_final}
 
 
 def main() -> None:
     args = parse_args()
-    args.oof_dir = Path(args.oof_dir)
-    args.output = Path(args.output)
-    args.cache_dir = Path(args.cache_dir) if args.cache_dir is not None else args.oof_dir / ".late_fusion_cache"
-    if args.chunk_size <= 0:
-        raise ValueError(f"--chunk-size must be positive, got {args.chunk_size}")
-    if args.weight_batch_size <= 0:
-        raise ValueError(f"--weight-batch-size must be positive, got {args.weight_batch_size}")
-    if args.prop_pair_batch_size <= 0:
-        raise ValueError(f"--prop-pair-batch-size must be positive, got {args.prop_pair_batch_size}")
-    thresholds = generate_thresholds(args.threshold_start, args.threshold_stop, args.threshold_step)
-
-    obo_path = Path(args.obo)
-    if not obo_path.exists():
-        raise FileNotFoundError(
-            f"GO OBO file not found: {obo_path}. "
-            "Provide the correct path with --obo, or place go-basic.obo at the default location."
-        )
-    print(f"Loading GO ontology from {obo_path} ...")
-    go_parents = parse_go_obo(obo_path)
-    print(f"  Loaded {len(go_parents)} GO terms.")
-
+    parents = parse_go_obo(args.obo)
     rows = []
-    summary = {}
+    summary: Dict[str, dict] = {}
+    aliases = {"esm2": "esm2_last", "t5": "prott5", "cnn": "esm2_l20"}
+    methods = [aliases.get(method, method) for method in args.methods]
+    required = {"esm2_last", "esm2_l20", "prott5", "blast"}
+    if set(methods) != required:
+        raise ValueError(f"Two-stage fusion requires methods {sorted(required)}, got {methods}")
     for aspect in args.aspect:
-        print(f"\nSearching late fusion for aspect={aspect} using methods={args.methods}")
-        payload = collect_oof_predictions(args.oof_dir, args.methods, aspect, args.fold, args.cache_dir)
-        try:
-            # Temperature calibration per method
-            temperatures = {}
-            for method in args.methods:
-                t = calibrate_temperature(payload["probs"][method], payload["labels"], chunk_size=args.chunk_size)
-                temperatures[method] = t
-                print(f"  Temperature for {method}: {t:.4f}")
-                apply_temperature_inplace(payload["probs"][method], t, chunk_size=args.chunk_size)
-
-            print(f"  Building propagation indices for {len(payload['classes'])} classes ...")
-            prop_indices = build_propagation_indices(payload["classes"], go_parents)
-
-            best = search_best_fusion(
-                payload,
-                args.methods,
-                thresholds,
-                args.weight_step,
-                prop_indices,
-                args.chunk_size,
-                cores=args.cores,
-                device_name=args.device,
-                weight_batch_size=args.weight_batch_size,
-                prop_pair_batch_size=args.prop_pair_batch_size,
-            )
-
-            rows.append(format_weight_row(aspect, best))
-            summary[aspect] = {
-                "weights": best["weights"],
-                "threshold": best["threshold"],
-                "metrics": best["metrics"],
-                "temperatures": temperatures,
-                "num_proteins": int(payload["labels"].shape[0]),
-                "num_classes": int(payload["labels"].shape[1]),
+        payload = collect_oof(args.oof_dir, aspect, args.fold, methods)
+        best = search_two_stage_fusion(payload, parents, args.weight_step)
+        chain_weights = best["neural"]["weights"]
+        final = best["final"]
+        rows.append(
+            {
+                "Aspect": aspect,
+                "W_ESM2_LAST": chain_weights["esm2_last"],
+                "W_ESM2_L20": chain_weights["esm2_l20"],
+                "W_PROTT5": chain_weights["prott5"],
+                "BETA_NEURAL": final["beta"],
+                "W_BLAST": 1.0 - final["beta"],
+                "THRESHOLD": final["metrics"]["fmax_threshold"],
+                "FMAX": final["metrics"]["fmax"],
+                "MICRO_F1": final["metrics"]["micro_f1"],
             }
-            if args.save_fused_oof:
-                save_fused_oof(args.oof_dir, aspect, payload, args.methods, best, args.chunk_size)
-
-            print(
-                f"  best weights={best['weights']} threshold={best['threshold']:.2f} "
-                f"propagated_fmax={best['metrics']['fmax']:.4f} "
-                f"micro_f1={best['metrics']['micro_f1']:.4f}"
-            )
-        finally:
-            payload["_tmpdir"].cleanup()
-
-    csv_path = args.output
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    frame = pd.DataFrame(rows)
-    
-    json_path = csv_path.with_name(csv_path.stem + "_summary.json")
-    
-    frame.to_csv(csv_path, index=False)
-    with json_path.open("w", encoding="utf-8") as handle:
+        )
+        summary[aspect] = {
+            "neural_weights": chain_weights,
+            "neural_metrics": best["neural"]["metrics"],
+            "beta": final["beta"],
+            "final_metrics": final["metrics"],
+        }
+        print(f"aspect={aspect} chain={chain_weights} beta={final['beta']:.2f} fmax={final['metrics']['fmax']:.4f}")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_csv(args.output, index=False)
+    with args.output.with_name(args.output.stem + "_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, sort_keys=True)
-
-    print(f"\nSaved fusion weights to {csv_path}")
+    print(f"Saved fusion weights to {args.output}")
 
 
 if __name__ == "__main__":

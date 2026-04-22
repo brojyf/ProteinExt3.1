@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import copy
-import gc
 import json
-import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, List
+from typing import Dict, Sequence
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -18,627 +15,243 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+from submethods import MODEL_BUILDERS
+from submethods.bp_blast_transfer import _build_database, _parse_blast_hits, _require_blast, _run_blast, _transfer_scores
+from training.data.data_utils import (
+    EMBEDDING_DIR,
+    PROTEIN_FEATURES_DIR,
+    MultiEmbeddingDataset,
+    build_and_save_protein_features,
+    build_sequence_protein_features,
+    collect_unique_sequences_from_folds,
+    collate_multi_embedding_batch,
+    load_fold_data,
+    load_or_build_global_label_space,
+    load_protein_features_cache,
+)
+from training.data.embedding import (
+    DEFAULT_ESM2_INTERMEDIATE_LAYER,
+    DEFAULT_ESM2_NAME,
+    DEFAULT_MAX_LENGTH,
+    DEFAULT_T5_NAME,
+    esm2_layer_dir,
+    extract_esm2_embeddings,
+    extract_t5_embeddings,
+)
+from training.data.go_utils import parse_go_obo
+from training.trainer import compute_multilabel_metrics, predict, train_one_epoch
+
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "models"
 DEFAULT_OOF_DIR = ROOT_DIR / "training" / "oof"
-
-
-def state_dict_to_cpu(state_dict: dict) -> dict:
-    return {
-        key: value.detach().cpu().clone() if isinstance(value, torch.Tensor) else copy.deepcopy(value)
-        for key, value in state_dict.items()
-    }
-
-
-def release_fold_result(result: dict | None, device: torch.device | None = None) -> None:
-    if result is None:
-        return
-    result.pop("payload", None)
-    result.pop("checkpoint", None)
-    result.pop("classes", None)
-    gc.collect()
-    if device is not None and device.type == "cuda":
-        torch.cuda.empty_cache()
+DEFAULT_OBO_PATH = ROOT_DIR / "data" / "go-basic.obo"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="ProteinExt3 training pipeline. CLI args override hparams.py defaults."
-    )
-    parser.add_argument("--method", choices=["cnn", "esm2", "t5", "blast"])
-    parser.add_argument("--aspect", choices=["P", "F", "C"])
-    parser.add_argument("--device", choices=["auto", "cuda", "cpu", "mps"], help="Force specific device")
-    parser.add_argument("--batch-size", dest="batch_size", type=int)
-    parser.add_argument("--epochs", type=int)
-    parser.add_argument("--fold", type=int, nargs="+")
+    parser = argparse.ArgumentParser(description="Train neural and BLAST GO predictors")
+    parser.add_argument("--method", choices=["esm2_last", "esm2_l20", "prott5", "blast", "esm2", "t5", "cnn"], default=None)
+    parser.add_argument("--aspect", choices=["P", "F", "C"], default=None)
+    parser.add_argument("--fold", type=int, nargs="+", default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default=None)
+    parser.add_argument("--min-count", type=int, default=None)
+    parser.add_argument("--obo", type=Path, default=DEFAULT_OBO_PATH)
     return parser.parse_args()
 
 
 def is_mps_available() -> bool:
-    return bool(
-        hasattr(torch.backends, "mps")
-        and torch.backends.mps.is_available()
-        and torch.backends.mps.is_built()
-    )
+    return bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available() and torch.backends.mps.is_built())
 
 
-def resolve_device(requested_device: str) -> torch.device:
-    if requested_device == "auto":
+def resolve_device(requested: str) -> torch.device:
+    if requested == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
         if is_mps_available():
             return torch.device("mps")
         return torch.device("cpu")
-
-    if requested_device == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("Requested device=cuda, but CUDA is not available.")
-        return torch.device("cuda")
-
-    if requested_device == "mps":
-        if not is_mps_available():
-            raise RuntimeError("Requested device=mps, but Apple Metal (MPS) is not available.")
-        return torch.device("mps")
-
-    return torch.device("cpu")
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("Requested cuda, but CUDA is not available")
+    if requested == "mps" and not is_mps_available():
+        raise RuntimeError("Requested mps, but MPS is not available")
+    return torch.device(requested)
 
 
-def print_device_summary(device: torch.device) -> None:
-    cuda_available = torch.cuda.is_available()
-    mps_available = is_mps_available()
-    print(
-        "Device Check | "
-        f"cuda_available={cuda_available} | "
-        f"mps_available={mps_available} | "
-        "cpu_available=True"
-    )
-    if device.type == "cuda":
-        device_name = torch.cuda.get_device_name(device)
-        print(f"Using device: cuda ({device_name})")
-    elif device.type == "mps":
-        print("Using device: mps (Apple Metal)")
-    else:
-        print("Using device: cpu")
-
-
-def namespace_from_config(config: dict) -> SimpleNamespace:
-    from training.data.data_utils import PROTEIN_FEATURE_DIM
-
+def apply_cli_overrides(config: Dict[str, object], args: argparse.Namespace) -> Dict[str, object]:
     resolved = dict(config)
-    resolved.setdefault("protein_feature_dim", PROTEIN_FEATURE_DIM)
-    resolved["output_dir"] = DEFAULT_OUTPUT_DIR
-    resolved["oof_dir"] = DEFAULT_OOF_DIR
-    resolved["device"] = resolve_device(str(config.get("device", "auto")))
-    return SimpleNamespace(**resolved)
-
-
-def apply_cli_overrides(run_config: dict, cli_args: argparse.Namespace) -> dict:
-    resolved = dict(run_config)
-    for key in ("method", "aspect", "batch_size", "epochs", "fold", "device"):
-        value = getattr(cli_args, key, None)
+    for key in ("method", "aspect", "fold", "epochs", "device", "min_count"):
+        value = getattr(args, key, None)
         if value is not None:
             resolved[key] = value
+    if args.batch_size is not None:
+        resolved["batch_size"] = args.batch_size
+    aliases = {"esm2": "esm2_last", "t5": "prott5", "cnn": "esm2_l20"}
+    resolved["method"] = aliases.get(str(resolved["method"]), resolved["method"])
     return resolved
 
 
-def build_datasets(args: SimpleNamespace, fold_data, protein_features_cache=None):
-    from training.data.data_utils import EMBEDDING_DIR, ProteinTokenEmbeddingDataset
-    from training.data.embedding import DEFAULT_ESM2_INTERMEDIATE_LAYER, esm2_layer_dir
+def namespace_from_config(config: Dict[str, object]) -> SimpleNamespace:
+    args = SimpleNamespace(**config)
+    args.device = resolve_device(str(args.device))
+    args.output_dir = DEFAULT_OUTPUT_DIR
+    args.oof_dir = DEFAULT_OOF_DIR
+    return args
 
-    if args.method == "t5":
-        dataset_kwargs = {
-            "plm": "t5",
-            "layer": "last",
-            "hydro_window_size": None,
-            "include_protein_features": True,
-        }
-    elif args.method == "esm2":
-        dataset_kwargs = {
-            "plm": "esm2",
-            "layer": "last",
-            "hydro_window_size": None,
-            "include_protein_features": True,
-        }
-    elif args.method == "cnn":
-        dataset_kwargs = {
-            "plm": "esm2",
-            "layer": esm2_layer_dir(DEFAULT_ESM2_INTERMEDIATE_LAYER),
-            "hydro_window_size": args.window_size,
-            "include_protein_features": True,
-        }
-    else:
-        raise ValueError(f"Unsupported training method: {args.method}")
 
-    train_dataset = ProteinTokenEmbeddingDataset(
-        pids=fold_data.train_pids,
-        sequences=fold_data.train_sequences,
-        labels=fold_data.train_matrix,
-        embedding_dir=EMBEDDING_DIR,
-        protein_features_cache=protein_features_cache,
-        **dataset_kwargs,
+def _embedding_exists(pid: str, plm: str, layer: str) -> bool:
+    return (EMBEDDING_DIR / plm / layer / f"{pid}.pt").exists()
+
+
+def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device: torch.device, method: str) -> None:
+    needs_esm2 = method in {"esm2_last", "esm2_l20"}
+    needs_t5 = method == "prott5"
+    missing_esm2 = [
+        pid for pid in sequences_by_pid
+        if not (_embedding_exists(pid, "esm2", "last") and _embedding_exists(pid, "esm2", esm2_layer_dir(DEFAULT_ESM2_INTERMEDIATE_LAYER)))
+    ] if needs_esm2 else []
+    missing_t5 = [pid for pid in sequences_by_pid if not _embedding_exists(pid, "t5", "last")] if needs_t5 else []
+    if missing_esm2:
+        extract_esm2_embeddings(
+            sequences_by_pid={pid: sequences_by_pid[pid] for pid in missing_esm2},
+            output_dir=EMBEDDING_DIR,
+            pretrained_name=DEFAULT_ESM2_NAME,
+            batch_size=batch_size,
+            max_length=DEFAULT_MAX_LENGTH,
+            device=device,
+            layer_index=DEFAULT_ESM2_INTERMEDIATE_LAYER,
+        )
+    if missing_t5:
+        extract_t5_embeddings(
+            sequences_by_pid={pid: sequences_by_pid[pid] for pid in missing_t5},
+            output_dir=EMBEDDING_DIR,
+            pretrained_name=DEFAULT_T5_NAME,
+            batch_size=batch_size,
+            max_length=DEFAULT_MAX_LENGTH,
+            device=device,
+        )
+
+
+def load_or_build_features(folds: Sequence[int]) -> Dict[str, torch.Tensor]:
+    path = PROTEIN_FEATURES_DIR / "protein_features.pt"
+    sequences = collect_unique_sequences_from_folds(folds)
+    if path.exists():
+        cache = load_protein_features_cache(path)
+        missing = {pid: seq for pid, seq in sequences.items() if pid not in cache}
+        if not missing:
+            return cache
+        cache.update({pid: build_sequence_protein_features(seq) for pid, seq in missing.items()})
+        torch.save(cache, path)
+        return cache
+    return build_and_save_protein_features(sequences, path)
+
+
+def save_oof(prefix: Path, pids: np.ndarray, labels: np.ndarray, probs: np.ndarray, classes: np.ndarray, metrics: dict) -> None:
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    np.save(prefix.with_name(prefix.name + "_pids.npy"), pids)
+    np.save(prefix.with_name(prefix.name + "_labels.npy"), labels)
+    np.save(prefix.with_name(prefix.name + "_probs.npy"), probs)
+    np.save(prefix.with_name(prefix.name + "_classes.npy"), classes)
+    with prefix.with_name(prefix.name + "_metrics.json").open("w", encoding="utf-8") as handle:
+        json.dump(metrics, handle, indent=2, sort_keys=True)
+
+
+def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Dict[str, torch.Tensor]) -> dict:
+    train_dataset = MultiEmbeddingDataset(
+        fold_data.train_pids, fold_data.train_matrix, EMBEDDING_DIR, protein_features_cache, chain=args.method
     )
-    val_dataset = ProteinTokenEmbeddingDataset(
-        pids=fold_data.val_pids,
-        sequences=fold_data.val_sequences,
-        labels=fold_data.val_matrix,
-        embedding_dir=EMBEDDING_DIR,
-        protein_features_cache=protein_features_cache,
-        **dataset_kwargs,
+    val_dataset = MultiEmbeddingDataset(
+        fold_data.val_pids, fold_data.val_matrix, EMBEDDING_DIR, protein_features_cache, chain=args.method
     )
-    return train_dataset, val_dataset
-
-
-def build_loaders(args: SimpleNamespace, fold_data, protein_features_cache=None):
-    from training.data.data_utils import collate_token_embedding_batch
-
-    train_dataset, val_dataset = build_datasets(args, fold_data, protein_features_cache)
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_token_embedding_batch,
-        pin_memory=(args.device.type == "cuda"),
-        persistent_workers=(args.num_workers > 0),
-        prefetch_factor=2 if args.num_workers > 0 else None,
+        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
+        collate_fn=collate_multi_embedding_batch,
     )
     val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size * 2,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_token_embedding_batch,
-        pin_memory=(args.device.type == "cuda"),
-        persistent_workers=(args.num_workers > 0),
-        prefetch_factor=2 if args.num_workers > 0 else None,
+        val_dataset, batch_size=args.batch_size * 2, shuffle=False, num_workers=args.num_workers,
+        collate_fn=collate_multi_embedding_batch,
     )
-    return train_loader, val_loader
-
-
-def serialize_value(value: Any) -> Any:
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, torch.device):
-        return str(value)
-    if isinstance(value, dict):
-        return {key: serialize_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [serialize_value(item) for item in value]
-    return value
-
-
-def save_outputs(
-    output_dir: Path,
-    run_prefix: str,
-    payload: dict,
-    classes: np.ndarray,
-    checkpoint: dict | None = None,
-) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    np.save(output_dir / f"{run_prefix}_pids.npy", payload["pids"])
-    np.save(output_dir / f"{run_prefix}_labels.npy", payload["labels"])
-    np.save(output_dir / f"{run_prefix}_probs.npy", payload["probs"])
-    np.save(output_dir / f"{run_prefix}_classes.npy", classes)
-
-    metrics_path = output_dir / f"{run_prefix}_metrics.json"
-    with metrics_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload["metrics"], handle, indent=2, sort_keys=True)
-
-    if checkpoint is not None:
-        torch.save(checkpoint, output_dir / f"{run_prefix}.pt")
-
-
-def build_optimizer(model: torch.nn.Module, args: SimpleNamespace) -> torch.optim.Optimizer:
-    optimizer_config = dict(args.optimizer)
-    trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    if not trainable_params:
-        raise RuntimeError(f"No trainable parameters found for method={args.method}")
-
-    if args.method in {"esm2", "t5"}:
-        classifier_lr = float(optimizer_config["classifier_lr"])
-        param_groups = [
-            {
-                "params": trainable_params,
-                "lr": classifier_lr,
-                "name": "classifier",
-            }
-        ]
-    else:
-        param_groups = [
-            {
-                "params": trainable_params,
-                "lr": float(optimizer_config["lr"]),
-                "name": "model",
-            }
-        ]
-
-    return torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
-
-
-def build_scheduler(
-    optimizer: torch.optim.Optimizer,
-    args: SimpleNamespace,
-    num_training_steps: int,
-) -> tuple[torch.optim.lr_scheduler.LambdaLR | None, int]:
-    if num_training_steps <= 0:
-        return None, 0
-
-    scheduler_config = dict(args.scheduler)
-    warmup_ratio = float(scheduler_config.get("warmup_ratio", 0.05))
-    min_lr_ratio = float(scheduler_config.get("min_lr_ratio", 0.0))
-    warmup_steps = int(round(num_training_steps * warmup_ratio))
-
-    def lr_lambda(current_step: int) -> float:
-        if warmup_steps > 0 and current_step < warmup_steps:
-            return float(current_step + 1) / float(max(1, warmup_steps))
-
-        progress = float(current_step - warmup_steps) / float(max(1, num_training_steps - warmup_steps))
-        progress = min(max(progress, 0.0), 1.0)
-        cosine_scale = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_scale
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda), warmup_steps
-
-
-def current_lrs(optimizer: torch.optim.Optimizer) -> dict[str, float]:
-    lrs = {}
-    for index, group in enumerate(optimizer.param_groups):
-        name = str(group.get("name", f"group_{index}"))
-        lrs[name] = float(group["lr"])
-    return lrs
-
-
-def format_lrs(optimizer: torch.optim.Optimizer) -> str:
-    return ", ".join(f"{name}={lr:.2e}" for name, lr in current_lrs(optimizer).items())
-
-
-def run_fold(args: SimpleNamespace, fold: int, protein_features_cache=None) -> dict:
-    from training.data.data_utils import load_fold_data
-    from submethods import MODEL_BUILDERS
-    from training.trainer import (
-        compute_multilabel_metrics,
-        evaluate_multilabel_metrics,
-        predict,
-        train_one_epoch,
-    )
-
-    fold_data = load_fold_data(fold=fold, aspect=args.aspect)
-    device = args.device
-
-    # AMP + gradient accumulation setup
-    use_amp = getattr(args, "use_amp", False) and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda") if use_amp else None
-    grad_accum = max(getattr(args, "gradient_accumulation_steps", 1), 1)
-    focal_gamma = float(getattr(args, "focal_gamma", 0.0))
-    label_smoothing = float(getattr(args, "label_smoothing", 0.0))
-    max_grad_norm = float(getattr(args, "max_grad_norm", 0.0))
-    asl_gamma_neg = float(getattr(args, "asl_gamma_neg", 0.0))
-    asl_gamma_pos = float(getattr(args, "asl_gamma_pos", 0.0))
-    asl_clip = float(getattr(args, "asl_clip", 0.05))
-
-    model = MODEL_BUILDERS[args.method](args, num_classes=len(fold_data.classes)).to(device)
-    if device.type == "cuda":
-        model = torch.compile(model)
-    train_loader, val_loader = build_loaders(args, fold_data, protein_features_cache)
-    optimizer = build_optimizer(model, args)
-
-    # Scheduler counts optimizer steps, not raw batch steps
-    steps_per_epoch = math.ceil(len(train_loader) / grad_accum)
-    total_steps = args.epochs * steps_per_epoch
-    scheduler, warmup_steps = build_scheduler(optimizer, args, total_steps)
-
-    print("=" * 80)
-    print(
-        f"Fold {fold} | method={args.method} | aspect={args.aspect} | "
-        f"train={len(fold_data.train_pids)} | val={len(fold_data.val_pids)} | classes={len(fold_data.classes)}"
-    )
-    print(
-        f"  optimizer_lrs: {format_lrs(optimizer)} | "
-        f"scheduler=warmup+cosine | warmup_steps={warmup_steps} | total_steps={total_steps}"
-    )
-    loss_desc = f"asl(neg={asl_gamma_neg},pos={asl_gamma_pos},clip={asl_clip})" if asl_gamma_neg > 0 else f"focal(gamma={focal_gamma})"
-    print(
-        f"  amp={use_amp} | grad_accum={grad_accum} | max_grad_norm={max_grad_norm} | "
-        f"loss={loss_desc} | label_smoothing={label_smoothing}"
-    )
-
+    model = MODEL_BUILDERS[args.method](args, num_classes=len(fold_data.classes)).to(args.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    best_state = None
     best_fmax = -1.0
-    best_epoch = 0
-    best_state_dict: dict | None = None
-
-    history: List[dict] = []
+    best_metrics = {}
     for epoch in range(1, args.epochs + 1):
-        train_result = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            scheduler,
-            device,
-            go_term_loss_weight=float(args.go_term_loss_weight),
-            progress_desc=f"Fold {fold} Epoch {epoch}/{args.epochs}",
-            scaler=scaler,
-            gradient_accumulation_steps=grad_accum,
-            focal_gamma=focal_gamma,
-            label_smoothing=label_smoothing,
-            max_grad_norm=max_grad_norm,
-            asl_gamma_neg=asl_gamma_neg,
-            asl_gamma_pos=asl_gamma_pos,
-            asl_clip=asl_clip,
-        )
-        epoch_metrics = evaluate_multilabel_metrics(
-            model,
-            val_loader,
-            device,
-            threshold=args.threshold,
-            progress_desc=f"Fold {fold} Epoch {epoch}/{args.epochs} Validation Metrics",
-            use_amp=use_amp,
-        )
-        epoch_lrs = current_lrs(optimizer)
-
-        is_best = epoch_metrics["fmax"] > best_fmax
-        if is_best:
-            best_fmax = epoch_metrics["fmax"]
-            best_epoch = epoch
-            best_state_dict = state_dict_to_cpu(model.state_dict())
-
-        history.append(
-            {
-                "epoch": epoch,
-                "train_loss": train_result.loss,
-                "train_bce_loss": train_result.bce_loss,
-                "train_go_term_loss": train_result.go_term_loss,
-                "train_go_term_soft_f1": train_result.go_term_soft_f1,
-                "val_metrics": epoch_metrics,
-                "lr": epoch_lrs,
-                "is_best": is_best,
-            }
-        )
-        print(
-            f"  fold {fold} | epoch {epoch:02d}{' *' if is_best else '  '} | train_loss={train_result.loss:.4f} | "
-            f"train_bce={train_result.bce_loss:.4f} | "
-            f"train_go_loss={train_result.go_term_loss:.4f} | "
-            f"train_go_f1={train_result.go_term_soft_f1:.4f} | "
-            f"val_micro_f1={epoch_metrics['micro_f1']:.4f} | "
-            f"val_precision={epoch_metrics['micro_precision']:.4f} | "
-            f"val_recall={epoch_metrics['micro_recall']:.4f} | "
-            f"fmax={epoch_metrics['fmax']:.4f} @ {epoch_metrics['fmax_threshold']:.2f} | "
-            f"lrs={', '.join(f'{name}={lr:.2e}' for name, lr in epoch_lrs.items())}"
-        )
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-        elif device.type == "mps":
-            torch.mps.empty_cache()
-
-    # Restore best epoch weights before final evaluation
-    print(f"  Restoring best weights from epoch {best_epoch} (fmax={best_fmax:.4f})")
-    if best_state_dict is None:
-        raise RuntimeError(f"No best weights were recorded for fold {fold}. Check epochs={args.epochs}.")
-    model.load_state_dict(best_state_dict)
-
-    predictions = predict(model, val_loader, device, progress_desc=f"Fold {fold} Final Validation", use_amp=use_amp)
-    model_probs = predictions["probs"]
-
-    metrics = compute_multilabel_metrics(
-        y_true=predictions["labels"],
-        y_prob=model_probs,
-        threshold=args.threshold,
-        progress_desc=f"Fold {fold} Final Fmax",
-    )
-    metrics["num_classes"] = int(len(fold_data.classes))
-    metrics["num_val_proteins"] = int(len(fold_data.val_pids))
-
-    serialized_args = serialize_value(vars(args))
+        result = train_one_epoch(model, train_loader, optimizer, args.device, f"fold {fold_data.fold_dir.name} epoch {epoch}")
+        predictions = predict(model, val_loader, args.device, "validation")
+        metrics = compute_multilabel_metrics(predictions["labels"], predictions["probs"], args.threshold)
+        print(f"fold={fold_data.fold_dir.name} epoch={epoch} loss={result.loss:.4f} fmax={metrics['fmax']:.4f}")
+        if metrics["fmax"] > best_fmax:
+            best_fmax = metrics["fmax"]
+            best_metrics = metrics
+            best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+    if best_state is None:
+        raise RuntimeError("No checkpoint was produced; check epochs")
+    model.load_state_dict(best_state)
+    predictions = predict(model, val_loader, args.device, "final validation")
+    metrics = compute_multilabel_metrics(predictions["labels"], predictions["probs"], args.threshold)
     checkpoint = {
-        "model_state_dict": state_dict_to_cpu(model.state_dict()),
+        "model_state_dict": best_state,
         "classes": fold_data.classes,
-        "args": serialized_args,
-        "config": serialized_args,
-        "history": history,
-        "fold": fold,
+        "args": vars(args).copy() | {"device": str(args.device), "output_dir": str(args.output_dir), "oof_dir": str(args.oof_dir)},
+        "metrics": metrics,
         "aspect": args.aspect,
         "method": args.method,
-        "metrics": metrics,
     }
-
-    payload = {
-        "pids": predictions["pids"],
-        "labels": predictions["labels"],
-        "probs": model_probs,
-        "metrics": metrics,
-        "history": history,
-    }
-    save_outputs(
-        output_dir=args.oof_dir,
-        run_prefix=f"{args.method}_{args.aspect}_fold{fold}",
-        payload=payload,
-        classes=fold_data.classes,
+    model_path = args.output_dir / f"{args.method}_{args.aspect}_{fold_data.fold_dir.name}.pt"
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(checkpoint, model_path)
+    save_oof(
+        args.oof_dir / f"{args.method}_{args.aspect}_{fold_data.fold_dir.name}",
+        predictions["pids"], predictions["labels"], predictions["probs"], fold_data.classes, metrics,
     )
-    # Always save fold checkpoint for ensemble inference
-    fold_checkpoint_path = args.output_dir / f"{args.method}_{args.aspect}_fold{fold}.pt"
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(checkpoint, fold_checkpoint_path)
-    if args.save_fold_artifacts:
-        save_outputs(
-            output_dir=args.output_dir,
-            run_prefix=f"{args.method}_{args.aspect}_fold{fold}",
-            payload=payload,
-            classes=fold_data.classes,
-        )
-    print(
-        f"  val micro_f1={metrics['micro_f1']:.4f} | "
-        f"precision={metrics['micro_precision']:.4f} | recall={metrics['micro_recall']:.4f}"
-    )
-    print("=" * 80)
-    return {
-        "fold": fold,
-        "metrics": metrics,
-        "payload": payload,
-        "classes": fold_data.classes,
-        "checkpoint": checkpoint,
-    }
+    return metrics if metrics["fmax"] >= best_metrics.get("fmax", -1) else best_metrics
 
 
-def run_blast_fold(args: SimpleNamespace, fold: int) -> dict:
-    from training.data.data_utils import load_fold_data
-    from submethods.bp_blast_transfer import (
-        _build_database,
-        _parse_blast_hits,
-        _require_blast,
-        _run_blast,
-        _transfer_scores,
-    )
-    from training.trainer import compute_multilabel_metrics
-
+def run_blast_fold(args: SimpleNamespace, fold_data) -> dict:
     _require_blast()
-    fold_data = load_fold_data(fold=fold, aspect=args.aspect)
-
-    blast_cache = fold_data.fold_dir / "blast_cache"
-    db_prefix = _build_database(fold_data.fold_dir / "train.fasta", blast_cache)
-    output_path = blast_cache / "val_vs_train.tsv"
-    _run_blast(fold_data.fold_dir / "val.fasta", db_prefix, output_path, max_hits=10, evalue=1e-3)
+    cache_dir = fold_data.fold_dir / "blast_cache"
+    db_prefix = _build_database(fold_data.fold_dir / "train.fasta", cache_dir)
+    output_path = cache_dir / "val_vs_train.tsv"
+    _run_blast(
+        fold_data.fold_dir / "val.fasta",
+        db_prefix,
+        output_path,
+        max_hits=args.blast_top_k,
+        evalue=1e-3,
+    )
     hits = _parse_blast_hits(output_path)
-
-    val_pids = np.asarray(fold_data.val_pids)
-    blast_scores = _transfer_scores(val_pids, hits, fold_data.train_labels_df, fold_data.classes)
-    val_labels = fold_data.val_matrix.toarray().astype(np.float32)
-
-    metrics = compute_multilabel_metrics(
-        y_true=val_labels,
-        y_prob=blast_scores,
-        threshold=args.threshold,
-        progress_desc=f"Fold {fold} BLAST Fmax",
-    )
-    metrics["num_classes"] = int(len(fold_data.classes))
-    metrics["num_val_proteins"] = int(len(fold_data.val_pids))
-
-    print("=" * 80)
-    print(
-        f"Fold {fold} | method=blast | aspect={args.aspect} | "
-        f"val={len(fold_data.val_pids)} | classes={len(fold_data.classes)}"
-    )
-
-    payload = {
-        "pids": val_pids,
-        "labels": val_labels,
-        "probs": blast_scores,
-        "metrics": metrics,
-    }
-    save_outputs(
-        output_dir=args.oof_dir,
-        run_prefix=f"blast_{args.aspect}_fold{fold}",
-        payload=payload,
-        classes=fold_data.classes,
-    )
-
-    print(
-        f"  val micro_f1={metrics['micro_f1']:.4f} | "
-        f"fmax={metrics['fmax']:.4f} @ {metrics['fmax_threshold']:.2f}"
-    )
-    print("=" * 80)
-    return {
-        "fold": fold,
-        "metrics": metrics,
-        "payload": payload,
-        "classes": fold_data.classes,
-        "checkpoint": None,
-    }
+    pids = np.asarray(fold_data.val_pids)
+    probs = _transfer_scores(pids, hits, fold_data.train_labels_df, fold_data.classes, tau=args.blast_tau)
+    labels = fold_data.val_matrix.toarray().astype(np.float32)
+    metrics = compute_multilabel_metrics(labels, probs, args.threshold)
+    save_oof(args.oof_dir / f"blast_{args.aspect}_{fold_data.fold_dir.name}", pids, labels, probs, fold_data.classes, metrics)
+    print(f"fold={fold_data.fold_dir.name} blast fmax={metrics['fmax']:.4f}")
+    return metrics
 
 
-def summarize_metrics(fold_results: List[dict]) -> dict:
-    summary = {}
-    for key in ("micro_f1", "micro_precision", "micro_recall", "fmax"):
-        values = [result["metrics"][key] for result in fold_results]
-        summary[f"avg_{key}"] = float(np.mean(values)) if values else 0.0
-    summary["best_fold"] = max(fold_results, key=lambda result: result["metrics"]["fmax"])["fold"]
-    return summary
-
-
-def save_best_result(args: SimpleNamespace, best_result: dict, summary: dict) -> None:
-    best_prefix = f"best_{args.method}_{args.aspect}"
-    best_output = {
-        **best_result["payload"],
-        "metrics": {
-            **best_result["metrics"],
-            "selected_as_best_by": "fmax",
-            "cv_summary": summary,
-        },
-    }
-    save_outputs(
-        output_dir=args.output_dir,
-        run_prefix=best_prefix,
-        payload=best_output,
-        classes=best_result["classes"],
-        checkpoint=best_result["checkpoint"],
-    )
-
-    summary_path = args.output_dir / f"{best_prefix}_cv_summary.json"
-    with summary_path.open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2, sort_keys=True)
-
-
-def _load_or_build_protein_features(folds) -> dict:
-    from training.data.data_utils import (
-        PROTEIN_FEATURES_DIR,
-        build_and_save_protein_features,
-        collect_unique_sequences_from_folds,
-        load_protein_features_cache,
-    )
-
-    features_path = PROTEIN_FEATURES_DIR / "protein_features.pt"
-    if features_path.exists():
-        print(f"Loading pre-computed protein features from {features_path}")
-        return load_protein_features_cache(features_path)
-
-    print("Pre-computing protein features for all training proteins ...")
-    sequences = collect_unique_sequences_from_folds(folds)
-    cache = build_and_save_protein_features(sequences, features_path)
-    print(f"  Saved {len(cache)} protein features to {features_path}")
-    return cache
-
-
-def _enable_cuda_optimizations() -> None:
-    if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        print("CUDA optimizations enabled: TF32 matmul + cuDNN")
-
-
-def run_training_job(config: dict) -> dict:
+def run_training_job(config: Dict[str, object], obo_path: Path) -> dict:
     args = namespace_from_config(config)
-    print()
-    print(f"Training Job | method={args.method} | aspect={args.aspect}")
+    parents = parse_go_obo(obo_path)
+    classes = load_or_build_global_label_space(
+        folds=args.fold, aspect=args.aspect, parents=parents, min_count=int(args.min_count)
+    )
+    if len(classes) == 0:
+        raise RuntimeError(f"Empty label space for aspect={args.aspect}, min_count={args.min_count}")
     if args.method != "blast":
-        print_device_summary(args.device)
-        _enable_cuda_optimizations()
-
-    # Load pre-computed protein features once for all folds
-    protein_features_cache = None
-    if args.method != "blast":
-        protein_features_cache = _load_or_build_protein_features(args.fold)
-
-    fold_results = []
-    best_result: dict | None = None
+        sequences = collect_unique_sequences_from_folds(args.fold)
+        ensure_embeddings(sequences, args.batch_size, args.device, args.method)
+        protein_features_cache = load_or_build_features(args.fold)
+    else:
+        protein_features_cache = {}
+    metrics_by_fold = []
     for fold in args.fold:
+        fold_data = load_fold_data(fold=fold, aspect=args.aspect, parents=parents, classes=classes)
         if args.method == "blast":
-            result = run_blast_fold(args, fold)
-            fold_results.append({"fold": result["fold"], "metrics": result["metrics"]})
-            release_fold_result(result, args.device)
+            metrics_by_fold.append(run_blast_fold(args, fold_data))
         else:
-            result = run_fold(args, fold, protein_features_cache)
-            fold_results.append({"fold": result["fold"], "metrics": result["metrics"]})
-            if best_result is None or result["metrics"]["fmax"] > best_result["metrics"]["fmax"]:
-                release_fold_result(best_result, args.device)
-                best_result = result
-            else:
-                release_fold_result(result, args.device)
-
-    summary = summarize_metrics(fold_results)
-    if args.method != "blast":
-        if best_result is None:
-            raise RuntimeError("No fold result was available to save as the best model.")
-        save_best_result(args, best_result, summary)
-        release_fold_result(best_result, args.device)
-    print("Summary:", json.dumps(summary, indent=2, sort_keys=True))
+            metrics_by_fold.append(run_neural_fold(args, fold_data, protein_features_cache))
+    summary = {"avg_fmax": float(np.mean([item["fmax"] for item in metrics_by_fold]))}
+    print(json.dumps(summary, indent=2, sort_keys=True))
     return summary
 
 
@@ -646,20 +259,12 @@ def main() -> None:
     from training.hparams import get_training_runs, resolve_training_run
 
     cli_args = parse_args()
-    training_runs = get_training_runs()
-    if not training_runs:
-        raise RuntimeError("No training runs configured in ProteinExt3/train/hparams.py.")
-
-    if cli_args.method or cli_args.aspect or cli_args.batch_size or cli_args.epochs or cli_args.fold:
-        base_method = cli_args.method or training_runs[0].get("method", "esm2")
-        base_aspect = cli_args.aspect or training_runs[0].get("aspect", "P")
-        base_config = resolve_training_run({"method": base_method, "aspect": base_aspect})
-        
-        run_training_job(apply_cli_overrides(base_config, cli_args))
+    if cli_args.method or cli_args.aspect:
+        base = resolve_training_run({"method": cli_args.method or "esm2_last", "aspect": cli_args.aspect or "P"})
+        run_training_job(apply_cli_overrides(base, cli_args), cli_args.obo)
         return
-
-    for run_config in training_runs:
-        run_training_job(run_config)
+    for config in get_training_runs():
+        run_training_job(config, cli_args.obo)
 
 
 if __name__ == "__main__":
