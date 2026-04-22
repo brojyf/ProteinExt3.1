@@ -55,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default=None)
     parser.add_argument("--min-count", type=int, default=None)
+    parser.add_argument("--cos-lr", action="store_true", help="Use cosine learning rate schedule")
     parser.add_argument("--obo", type=Path, default=DEFAULT_OBO_PATH)
     return parser.parse_args()
 
@@ -85,6 +86,8 @@ def apply_cli_overrides(config: Dict[str, object], args: argparse.Namespace) -> 
             resolved[key] = value
     if args.batch_size is not None:
         resolved["batch_size"] = args.batch_size
+    if args.cos_lr:
+        resolved["lr_scheduler"] = "cosine"
     aliases = {"esm2": "esm2_last", "t5": "prott5"}
     resolved["method"] = aliases.get(str(resolved["method"]), resolved["method"])
     return resolved
@@ -174,13 +177,23 @@ def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Di
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     use_amp = args.device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=args.lr_factor,
-        patience=args.lr_patience,
-        min_lr=args.min_lr,
-    )
+    if args.lr_scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+            eta_min=args.min_lr,
+        )
+    elif args.lr_scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=args.lr_factor,
+            patience=args.lr_patience,
+            min_lr=args.min_lr,
+        )
+    else:
+        raise ValueError(f"Unsupported lr_scheduler={args.lr_scheduler}")
+    print(f"fold={fold_data.fold_dir.name} lr_scheduler={args.lr_scheduler}")
     best_state = None
     best_fmax = -1.0
     best_metrics = {}
@@ -208,9 +221,12 @@ def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Di
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
         else:
             epochs_without_improvement += 1
-        scheduler.step(fmax)
+        if args.lr_scheduler == "cosine":
+            scheduler.step()
+        else:
+            scheduler.step(fmax)
         next_lr = float(optimizer.param_groups[0]["lr"])
-        if next_lr < epoch_lr:
+        if args.lr_scheduler == "plateau" and next_lr < epoch_lr:
             print(f"fold={fold_data.fold_dir.name} epoch={epoch} reduce_lr={next_lr:.2e}")
         if epochs_without_improvement >= args.early_stop_patience:
             print(
@@ -301,10 +317,10 @@ def main() -> None:
 
     cli_args = parse_args()
     if cli_args.method or cli_args.aspect:
-        base = resolve_matching_training_run(cli_args.method or "esm2_last", cli_args.aspect or "P")
+        base = resolve_matching_training_run(cli_args.method or "esm2_last", cli_args.aspect or "P", cli_args.cos_lr)
         run_training_job(apply_cli_overrides(base, cli_args), cli_args.obo)
         return
-    for config in get_training_runs():
+    for config in get_training_runs(cli_args.cos_lr):
         run_training_job(config, cli_args.obo)
 
 

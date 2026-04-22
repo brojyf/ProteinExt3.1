@@ -18,6 +18,7 @@ COMMON_TRAINING_CONFIG: Dict[str, object] = {
     "lr_factor": 0.5,
     "lr_patience": 2,
     "min_lr": 5e-5,
+    "lr_scheduler": "plateau",
     "early_stop_patience": 6,
     "early_stop_min_delta": 1e-4,
     "weight_decay": 2e-4,
@@ -28,6 +29,10 @@ COMMON_TRAINING_CONFIG: Dict[str, object] = {
     "t5_embedding_dim": 1024,
     "blast_top_k": 30,
     "blast_tau": 50.0,
+}
+
+COSINE_TRAINING_CONFIG: Dict[str, object] = {
+    "lr_scheduler": "cosine",
 }
 
 TRAINING_RUNS: List[Dict[str, object]] = [
@@ -136,21 +141,23 @@ TRAINING_RUNS: List[Dict[str, object]] = [
 ]
 
 
-def resolve_training_run(run_config: Dict[str, object]) -> Dict[str, object]:
+def resolve_training_run(run_config: Dict[str, object], use_cosine_lr: bool = False) -> Dict[str, object]:
     resolved = deepcopy(COMMON_TRAINING_CONFIG)
+    if use_cosine_lr:
+        resolved.update(deepcopy(COSINE_TRAINING_CONFIG))
     resolved.update(deepcopy(run_config))
     aliases = {"esm2": "esm2_last", "t5": "prott5"}
     resolved["method"] = aliases.get(str(resolved["method"]), resolved["method"])
     return resolved
 
 
-def get_training_runs() -> List[Dict[str, object]]:
-    return [resolve_training_run(run) for run in TRAINING_RUNS if bool(run.get("enabled", True))]
+def get_training_runs(use_cosine_lr: bool = False) -> List[Dict[str, object]]:
+    return [resolve_training_run(run, use_cosine_lr) for run in TRAINING_RUNS if bool(run.get("enabled", True))]
 
 
-def resolve_matching_training_run(method: str, aspect: str) -> Dict[str, object]:
-    target = resolve_training_run({"method": method, "aspect": aspect})
-    for run in get_training_runs():
+def resolve_matching_training_run(method: str, aspect: str, use_cosine_lr: bool = False) -> Dict[str, object]:
+    target = resolve_training_run({"method": method, "aspect": aspect}, use_cosine_lr)
+    for run in get_training_runs(use_cosine_lr):
         if run["method"] == target["method"] and run["aspect"] == target["aspect"]:
             return run
     return target
