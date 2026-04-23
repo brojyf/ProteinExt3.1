@@ -55,6 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default=None)
     parser.add_argument("--min-count", type=int, default=None)
+    parser.add_argument("--blast-threads", type=int, default=None)
     parser.add_argument("--cos-lr", action="store_true", help="Use cosine learning rate schedule")
     parser.add_argument("--obo", type=Path, default=DEFAULT_OBO_PATH)
     return parser.parse_args()
@@ -86,6 +87,8 @@ def apply_cli_overrides(config: Dict[str, object], args: argparse.Namespace) -> 
             resolved[key] = value
     if args.batch_size is not None:
         resolved["batch_size"] = args.batch_size
+    if args.blast_threads is not None:
+        resolved["blast_threads"] = args.blast_threads
     if args.cos_lr:
         resolved["lr_scheduler"] = "cosine"
     aliases = {"esm2": "esm2_last", "t5": "prott5"}
@@ -279,10 +282,11 @@ def run_blast_fold(args: SimpleNamespace, fold_data) -> dict:
         output_path,
         max_hits=args.blast_top_k,
         evalue=1e-3,
+        num_threads=getattr(args, "blast_threads", 8),
     )
     hits = _parse_blast_hits(output_path)
     pids = np.asarray(fold_data.val_pids)
-    probs = _transfer_scores(pids, hits, fold_data.train_labels_df, fold_data.classes, tau=args.blast_tau)
+    probs = _transfer_scores(pids, hits, fold_data.train_labels_df, fold_data.classes)
     labels = fold_data.val_matrix.toarray().astype(np.float32)
     metrics = compute_multilabel_metrics(labels, probs, args.threshold)
     save_oof(args.oof_dir / f"blast_{args.aspect}_{fold_data.fold_dir.name}", pids, labels, probs, fold_data.classes, metrics)

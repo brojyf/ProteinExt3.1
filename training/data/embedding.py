@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import re
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
 
@@ -106,6 +107,12 @@ def print_embedding_device_summary(device: torch.device) -> None:
     print(f"Embedding extraction device: {device.type}")
 
 
+def embedding_autocast(device: torch.device):
+    if device.type == "cuda":
+        return torch.amp.autocast("cuda")
+    return nullcontext()
+
+
 @torch.inference_mode()
 def extract_esm2_embeddings(
     *,
@@ -148,7 +155,7 @@ def extract_esm2_embeddings(
             return_tensors="pt",
         )
         tokens = {key: value.to(device) for key, value in tokens.items()}
-        with torch.amp.autocast(device.type):
+        with embedding_autocast(device):
             outputs = model(**tokens, output_hidden_states=True)
 
         last_hidden = outputs.last_hidden_state.detach().cpu().to(torch.float16)
@@ -209,7 +216,7 @@ def extract_t5_embeddings(
             return_tensors="pt",
         )
         tokens = {key: value.to(device) for key, value in tokens.items()}
-        with torch.amp.autocast(device.type):
+        with embedding_autocast(device):
             outputs = model(**tokens)
             
         hidden = outputs.last_hidden_state.detach().cpu().to(torch.float16)

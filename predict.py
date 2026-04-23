@@ -20,7 +20,6 @@ from tqdm.auto import tqdm
 from submethods import MODEL_BUILDERS
 from submethods.bp_blast_transfer import _build_database, _parse_blast_hits, _require_blast, _run_blast, _transfer_scores
 from training.data.data_utils import (
-    EMBEDDING_DIR,
     MultiEmbeddingDataset,
     build_sequence_protein_features,
     collate_multi_embedding_batch,
@@ -42,6 +41,13 @@ from training.trainer import predict as predict_batches
 DEFAULT_OUTPUT_PATH = ROOT_DIR / "predictions" / "predictions.tsv"
 DEFAULT_MODELS_DIR = ROOT_DIR / "models"
 DEFAULT_OBO_PATH = ROOT_DIR / "data" / "go-basic.obo"
+PREDICT_EMBEDDING_DIR = ROOT_DIR / "data" / "embedding"
+FUSION_COMPONENTS = {
+    "esm2_last": "last",
+    "esm2_l20": "l20",
+    "prott5": "t5",
+    "blast": "blast",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aspect", choices=["P", "F", "C", "PFC"], default="PFC")
     parser.add_argument("--batch-size", "--batchsize", dest="batch_size", type=int, default=2)
     parser.add_argument("--cpu", type=int, default=8)
-    parser.add_argument("--weights", type=Path, default=DEFAULT_MODELS_DIR / "fusion_weights.csv")
+    parser.add_argument("--weight", "--weights", dest="weights", type=Path, default=DEFAULT_MODELS_DIR / "fusion_weights.csv")
     parser.add_argument("--obo", type=Path, default=DEFAULT_OBO_PATH)
     parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
     parser.add_argument("--no-propagate", action="store_true")
@@ -68,14 +74,17 @@ def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device:
     needs_t5 = "prott5" in methods
     missing_esm2 = [
         pid for pid in sequences_by_pid
-        if not ((EMBEDDING_DIR / "esm2" / "last" / f"{pid}.pt").exists()
-                and (EMBEDDING_DIR / "esm2" / esm2_layer_dir(DEFAULT_ESM2_INTERMEDIATE_LAYER) / f"{pid}.pt").exists())
+        if not ((PREDICT_EMBEDDING_DIR / "esm2" / "last" / f"{pid}.pt").exists()
+                and (PREDICT_EMBEDDING_DIR / "esm2" / esm2_layer_dir(DEFAULT_ESM2_INTERMEDIATE_LAYER) / f"{pid}.pt").exists())
     ] if needs_esm2 else []
-    missing_t5 = [pid for pid in sequences_by_pid if not (EMBEDDING_DIR / "t5" / "last" / f"{pid}.pt").exists()] if needs_t5 else []
+    missing_t5 = [pid for pid in sequences_by_pid if not (PREDICT_EMBEDDING_DIR / "t5" / "last" / f"{pid}.pt").exists()] if needs_t5 else []
+    if missing_esm2 or missing_t5:
+        print(f"Embedding cache: {PREDICT_EMBEDDING_DIR}")
+        print(f"Embedding extraction device: {device.type}")
     if missing_esm2:
         extract_esm2_embeddings(
             sequences_by_pid={pid: sequences_by_pid[pid] for pid in missing_esm2},
-            output_dir=EMBEDDING_DIR,
+            output_dir=PREDICT_EMBEDDING_DIR,
             pretrained_name=DEFAULT_ESM2_NAME,
             batch_size=batch_size,
             max_length=DEFAULT_MAX_LENGTH,
@@ -85,7 +94,7 @@ def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device:
     if missing_t5:
         extract_t5_embeddings(
             sequences_by_pid={pid: sequences_by_pid[pid] for pid in missing_t5},
-            output_dir=EMBEDDING_DIR,
+            output_dir=PREDICT_EMBEDDING_DIR,
             pretrained_name=DEFAULT_T5_NAME,
             batch_size=batch_size,
             max_length=DEFAULT_MAX_LENGTH,
@@ -97,7 +106,10 @@ def normalize_method(method: str) -> str:
     return {"esm2": "esm2_last", "t5": "prott5"}.get(method, method)
 
 
-def checkpoint_paths(method: str, aspect: str) -> List[Path]:
+def checkpoint_paths(method: str, aspect: str, fold: int | None = None) -> List[Path]:
+    if fold is not None:
+        path = DEFAULT_MODELS_DIR / f"{method}_{aspect}_fold_{fold}.pt"
+        return [path] if path.exists() else []
     return sorted(DEFAULT_MODELS_DIR.glob(f"{method}_{aspect}_fold_*.pt"))
 
 
@@ -119,13 +131,15 @@ def run_chain_inference(
     sequences_by_pid: Dict[str, str],
     batch_size: int,
     device: torch.device,
+    fold: int | None = None,
 ) -> dict:
-    paths = checkpoint_paths(method, aspect)
+    paths = checkpoint_paths(method, aspect, fold)
     if not paths:
-        raise FileNotFoundError(f"No {method} checkpoints found for aspect={aspect} in {DEFAULT_MODELS_DIR}")
+        fold_text = f" fold={fold}" if fold is not None else ""
+        raise FileNotFoundError(f"No {method} checkpoints found for aspect={aspect}{fold_text} in {DEFAULT_MODELS_DIR}")
     pids = sorted(sequences_by_pid)
     features = {pid: build_sequence_protein_features(seq) for pid, seq in sequences_by_pid.items()}
-    dataset = MultiEmbeddingDataset(pids, None, EMBEDDING_DIR, features, chain=method)
+    dataset = MultiEmbeddingDataset(pids, None, PREDICT_EMBEDDING_DIR, features, chain=method)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_multi_embedding_batch)
     fold_probs = []
     classes = None
@@ -148,16 +162,22 @@ def run_chain_inference(
 
 def load_fusion_weights(path: Path, aspect: str) -> dict:
     frame = pd.read_csv(path)
-    row = frame[frame["Aspect"] == aspect]
+    row = frame[frame["aspect"] == aspect]
     if row.empty:
         raise ValueError(f"No fusion weights for aspect={aspect} in {path}")
     item = row.iloc[0].to_dict()
     return {
-        "esm2_last": float(item.get("W_ESM2_LAST", 0.0)),
-        "esm2_l20": float(item.get("W_ESM2_L20", 0.0)),
-        "prott5": float(item.get("W_PROTT5", 0.0)),
-        "beta": float(item.get("BETA_NEURAL", 1.0)),
-        "threshold": float(item.get("THRESHOLD", 0.5)),
+        "esm2_last": float(item.get("w_last", 0.0)),
+        "esm2_l20": float(item.get("w_l20", 0.0)),
+        "prott5": float(item.get("w_t5", 0.0)),
+        "blast": float(item.get("w_blast", 0.0)),
+        "threshold": float(item.get("thr", 0.5)),
+        "folds": {
+            "esm2_last": int(item["fold_last"]),
+            "esm2_l20": int(item["fold_l20"]),
+            "prott5": int(item["fold_t5"]),
+            "blast": int(item["fold_blast"]),
+        },
     }
 
 
@@ -173,20 +193,43 @@ def align_probs(reference_pids: np.ndarray, reference_classes: np.ndarray, resul
     return aligned
 
 
-def run_blast_inference(input_fasta: Path, pids: np.ndarray, classes: np.ndarray, aspect: str, cpu: int) -> np.ndarray:
+def load_blast_labels() -> pd.DataFrame:
+    labels_path = ROOT_DIR / "data" / "blast" / "blast.tsv"
+    if not labels_path.exists():
+        raise FileNotFoundError("BLAST inference requires data/blast/blast.tsv")
+    return pd.read_csv(labels_path, sep="\t")
+
+
+def run_blast_search(input_fasta: Path, cpu: int) -> Dict[str, List[dict]]:
     _require_blast()
     blast_dir = ROOT_DIR / "data" / "blast"
-    labels_path = blast_dir / "blast.tsv"
     fasta_path = blast_dir / "blast.fasta"
-    if not labels_path.exists() or not fasta_path.exists():
-        raise FileNotFoundError("BLAST inference requires data/blast/blast.fasta and data/blast/blast.tsv")
+    if not fasta_path.exists():
+        raise FileNotFoundError("BLAST inference requires data/blast/blast.fasta")
     db_prefix = _build_database(fasta_path, blast_dir / "cache")
     output_path = blast_dir / "cache" / "query_vs_blast.tsv"
-    _run_blast(input_fasta, db_prefix, output_path, max_hits=30, evalue=1e-3, num_threads=cpu)
-    hits = _parse_blast_hits(output_path)
-    labels_df = pd.read_csv(labels_path, sep="\t")
+    _run_blast(input_fasta, db_prefix, output_path, max_hits=15, evalue=1e-3, num_threads=cpu)
+    return _parse_blast_hits(output_path)
+
+
+def blast_classes(labels_df: pd.DataFrame, aspect: str) -> np.ndarray:
+    return np.asarray(sorted(labels_df[labels_df["aspect"] == aspect]["term"].unique()), dtype=object)
+
+
+def transfer_blast_scores(
+    hits: Dict[str, List[dict]],
+    labels_df: pd.DataFrame,
+    pids: np.ndarray,
+    classes: np.ndarray,
+    aspect: str,
+) -> np.ndarray:
     labels_df = labels_df[labels_df["aspect"] == aspect]
     return _transfer_scores(pids, hits, labels_df, classes)
+
+
+def run_blast_inference(input_fasta: Path, pids: np.ndarray, classes: np.ndarray, aspect: str, cpu: int) -> np.ndarray:
+    labels_df = load_blast_labels()
+    return transfer_blast_scores(run_blast_search(input_fasta, cpu), labels_df, pids, classes, aspect)
 
 
 def collect_rows(pids: np.ndarray, classes: np.ndarray, probs: np.ndarray) -> List[tuple[str, str, float]]:
@@ -206,6 +249,10 @@ def write_predictions(path: Path, rows: Sequence[tuple[str, str, float]]) -> Non
             writer.writerow([pid, term, f"{score:.6f}"])
 
 
+def component_output_path(output_path: Path, suffix: str) -> Path:
+    return output_path.with_name(f"{output_path.stem}_{suffix}{output_path.suffix}")
+
+
 def main() -> None:
     args = parse_args()
     if not args.input.exists():
@@ -218,22 +265,29 @@ def main() -> None:
     device = resolve_device(args.device)
     rows: List[tuple[str, str, float]] = []
     method = normalize_method(args.method)
+    component_rows: Dict[str, List[tuple[str, str, float]]] = {
+        suffix: [] for suffix in FUSION_COMPONENTS.values()
+    } if method == "fusion" else {}
     neural_methods = ["esm2_last", "esm2_l20", "prott5"] if method == "fusion" else [method]
     if method != "blast":
         ensure_embeddings(sequences, args.batch_size, device, neural_methods)
+    blast_labels = load_blast_labels() if method in {"blast", "fusion"} else None
+    blast_hits = run_blast_search(args.input, args.cpu) if method in {"blast", "fusion"} else None
     for aspect in tqdm(aspects, desc="aspects", dynamic_ncols=True):
-        if args.method == "blast":
-            labels = pd.read_csv(ROOT_DIR / "data" / "blast" / "blast.tsv", sep="\t")
-            classes = np.asarray(sorted(labels[labels["aspect"] == aspect]["term"].unique()), dtype=object)
+        if method == "blast":
+            if blast_hits is None or blast_labels is None:
+                raise RuntimeError("BLAST hits were not initialized")
+            classes = blast_classes(blast_labels, aspect)
             pids = np.asarray(sorted(sequences))
-            probs = run_blast_inference(args.input, pids, classes, aspect, args.cpu)
+            probs = transfer_blast_scores(blast_hits, blast_labels, pids, classes, aspect)
         else:
             if method == "fusion":
+                if blast_hits is None or blast_labels is None:
+                    raise RuntimeError("BLAST hits were not initialized")
                 weights = load_fusion_weights(args.weights, aspect)
                 component_results = {
-                    chain: run_chain_inference(chain, aspect, sequences, args.batch_size, device)
+                    chain: run_chain_inference(chain, aspect, sequences, args.batch_size, device, weights["folds"][chain])
                     for chain in ("esm2_last", "esm2_l20", "prott5")
-                    if weights[chain] > 0
                 }
                 if not component_results:
                     raise RuntimeError(f"Fusion weights contain no neural component for aspect={aspect}")
@@ -241,21 +295,37 @@ def main() -> None:
                 pids = first["pids"]
                 classes = first["classes"]
                 neural_probs = np.zeros_like(first["probs"], dtype=np.float32)
+                component_probs = {}
                 for chain, result in component_results.items():
-                    neural_probs += weights[chain] * align_probs(pids, classes, result)
-                chain_weight_sum = sum(weights[chain] for chain in ("esm2_last", "esm2_l20", "prott5"))
-                neural_probs /= max(chain_weight_sum, 1e-8)
-                blast_probs = run_blast_inference(args.input, pids, classes, aspect, args.cpu)
-                probs = weights["beta"] * neural_probs + (1.0 - weights["beta"]) * blast_probs
+                    aligned = align_probs(pids, classes, result)
+                    component_probs[FUSION_COMPONENTS[chain]] = aligned
+                    neural_probs += weights[chain] * aligned
+                blast_probs = transfer_blast_scores(blast_hits, blast_labels, pids, classes, aspect)
+                component_probs["blast"] = blast_probs
+                probs = neural_probs + weights["blast"] * blast_probs
             else:
+                component_probs = {}
                 result = run_chain_inference(method, aspect, sequences, args.batch_size, device)
                 pids = result["pids"]
                 classes = result["classes"]
                 probs = result["probs"]
         if parents is not None:
-            probs = propagate_scores(probs, build_propagation_indices(classes, parents))
+            prop_indices = build_propagation_indices(classes, parents)
+            if method == "fusion":
+                component_probs = {
+                    name: propagate_scores(values, prop_indices)
+                    for name, values in component_probs.items()
+                }
+            probs = propagate_scores(probs, prop_indices)
+        if method == "fusion":
+            for name, values in component_probs.items():
+                component_rows[name].extend(collect_rows(pids, classes, values))
         rows.extend(collect_rows(pids, classes, probs))
     write_predictions(args.output, rows)
+    for suffix, method_rows in component_rows.items():
+        path = component_output_path(args.output, suffix)
+        write_predictions(path, method_rows)
+        print(f"Saved {suffix} predictions to {path}")
     print(f"Saved predictions to {args.output}")
 
 

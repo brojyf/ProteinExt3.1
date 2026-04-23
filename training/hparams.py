@@ -28,7 +28,6 @@ COMMON_TRAINING_CONFIG: Dict[str, object] = {
     "esm2_embedding_dim": 1280,
     "t5_embedding_dim": 1024,
     "blast_top_k": 30,
-    "blast_tau": 50.0,
 }
 
 COSINE_TRAINING_CONFIG: Dict[str, object] = {
@@ -135,9 +134,9 @@ TRAINING_RUNS: List[Dict[str, object]] = [
         "bottleneck": 512,
         "dropout": 0.3,
     },
-    {"method": "blast", "aspect": "P", "min_count": 30, "blast_top_k": 50, "blast_tau": 75.0},
-    {"method": "blast", "aspect": "F", "min_count": 15, "blast_top_k": 30, "blast_tau": 40.0},
-    {"method": "blast", "aspect": "C", "min_count": 10, "blast_top_k": 40, "blast_tau": 65.0},
+    {"method": "blast", "aspect": "P", "min_count": 30, "blast_top_k": 15},
+    {"method": "blast", "aspect": "F", "min_count": 15, "blast_top_k": 15},
+    {"method": "blast", "aspect": "C", "min_count": 10, "blast_top_k": 15},
 ]
 
 
