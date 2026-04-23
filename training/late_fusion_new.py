@@ -14,6 +14,7 @@ if str(ROOT_DIR) not in sys.path:
 
 import numpy as np
 import pandas as pd
+import torch
 from tqdm.auto import tqdm
 
 from training.data.go_utils import build_propagation_indices, parse_go_obo, propagate_scores
@@ -29,6 +30,10 @@ METHOD_COLUMNS = {
     "blast": "blast",
 }
 FMAX_THRESHOLDS = np.linspace(0.01, 0.99, 99)
+CPU_BATCH_BYTES = 500_000_000
+CUDA_WORKING_BYTES_FRACTION = 0.7
+CUDA_PROPAGATION_CLASS_LIMIT = 5_000
+MPS_BATCH_BYTES = 6_000_000_000
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,6 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--obo", type=Path, default=DEFAULT_OBO_PATH)
     parser.add_argument("--step", type=float, default=0.1)
+    parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
     parser.add_argument("--jobs", type=int, default=0, help="Parallel aspect jobs; 0 uses one job per requested aspect")
     return parser.parse_args()
 
@@ -91,6 +97,33 @@ def simplex_grid(methods: Iterable[str], step: float) -> List[Dict[str, float]]:
     ]
 
 
+def neighborhood_grid(center: Dict[str, float], methods: List[str], step: float, radius: float) -> List[Dict[str, float]]:
+    """Simplex grid points within L-inf *radius* of *center*."""
+    validate_step(step)
+    units = int(round(1.0 / step))
+    n = len(methods)
+    bounds = []
+    for m in methods:
+        lo = max(0, int(np.ceil((center[m] - radius) / step - 1e-9)))
+        hi = min(units, int(np.floor((center[m] + radius) / step + 1e-9)))
+        bounds.append((lo, hi))
+
+    def _enum(idx: int, remaining: int):
+        if idx == n - 1:
+            lo, hi = bounds[idx]
+            if lo <= remaining <= hi:
+                yield (remaining,)
+            return
+        lo, hi = bounds[idx]
+        for val in range(max(lo, 0), min(hi, remaining) + 1):
+            yield from ((val,) + rest for rest in _enum(idx + 1, remaining - val))
+
+    return [
+        {m: round(v * step, 10) for m, v in zip(methods, point)}
+        for point in _enum(0, units)
+    ]
+
+
 def best_fold(oof_dir: Path, method: str, aspect: str, folds: List[int]) -> int:
     best = None
     for fold in folds:
@@ -127,6 +160,7 @@ def load_aspect_references(oof_dir: Path, aspect: str, folds: List[int], parents
         true_per = propagated_labels.sum(axis=1)
         references.append(
             {
+                "aspect": aspect,
                 "fold": fold,
                 "shape": labels.shape,
                 "prop_indices": prop_indices,
@@ -151,22 +185,37 @@ def empty_metric_accumulator() -> dict:
 
 
 def update_metric_accumulator(accumulator: dict, labels: np.ndarray, true_per: np.ndarray, has_label: np.ndarray, probs: np.ndarray) -> None:
+    n_prot, n_cls = probs.shape
     label_count = int(has_label.sum())
     accumulator["recall_count"] += label_count
     accumulator["true_pos"] += int(true_per.sum())
-    for index, threshold in enumerate(FMAX_THRESHOLDS):
-        pred = probs >= threshold
-        pred_per = pred.sum(axis=1)
-        tp_per = np.logical_and(pred, labels).sum(axis=1)
-        has_pred_and_label = (pred_per > 0) & has_label
-        if has_pred_and_label.any():
-            accumulator["precision_sum"][index] += float((tp_per[has_pred_and_label] / pred_per[has_pred_and_label]).sum())
-            accumulator["precision_count"][index] += int(has_pred_and_label.sum())
+
+    # Vectorize: process multiple thresholds per chunk via broadcasting
+    n_thr = len(FMAX_THRESHOLDS)
+    chunk = max(1, min(n_thr, 500_000_000 // max(n_prot * n_cls, 1)))
+    has_label_row = has_label[None, :]
+    true_per_labeled = true_per[has_label]
+
+    for t0 in range(0, n_thr, chunk):
+        t1 = min(t0 + chunk, n_thr)
+        pred = probs[None, :, :] >= FMAX_THRESHOLDS[t0:t1, None, None]  # (K, N, C)
+        pred_per = pred.sum(axis=2)                                      # (K, N)
+        pred &= labels[None, :, :]                                       # in-place AND
+        tp_per = pred.sum(axis=2)                                        # (K, N)
+        del pred
+
+        mask = (pred_per > 0) & has_label_row
+        safe_denom = np.where(pred_per > 0, pred_per, 1)
+        prec_vals = tp_per / safe_denom
+        accumulator["precision_sum"][t0:t1] += np.where(mask, prec_vals, 0.0).sum(axis=1)
+        accumulator["precision_count"][t0:t1] += mask.sum(axis=1)
+
         if label_count:
-            accumulator["recall_sum"][index] += float((tp_per[has_label] / true_per[has_label]).sum())
-    pred = probs >= 0.5
-    accumulator["default_tp"] += int(np.logical_and(pred, labels).sum())
-    accumulator["default_pred_pos"] += int(pred.sum())
+            accumulator["recall_sum"][t0:t1] += (tp_per[:, has_label] / true_per_labeled[None, :]).sum(axis=1)
+
+    pred05 = probs >= 0.5
+    accumulator["default_tp"] += int(np.logical_and(pred05, labels).sum())
+    accumulator["default_pred_pos"] += int(pred05.sum())
 
 
 def finalize_metric_accumulator(accumulator: dict) -> Dict[str, float]:
@@ -211,29 +260,139 @@ def update_progress(progress: tqdm | None) -> None:
         progress.update(1)
 
 
+def is_mps_available() -> bool:
+    return bool(hasattr(torch.backends, "mps") and torch.backends.mps.is_available() and torch.backends.mps.is_built())
+
+
+def score_matrix_bytes(shape: tuple[int, int]) -> int:
+    n_prot, n_cls = shape
+    return n_prot * n_cls * 4
+
+
+def cpu_batch_size(n_candidates: int, shape: tuple[int, int]) -> int:
+    return max(1, min(n_candidates, CPU_BATCH_BYTES // max(score_matrix_bytes(shape), 1)))
+
+
+def cuda_batch_size(n_candidates: int, shape: tuple[int, int]) -> int:
+    bytes_per = score_matrix_bytes(shape)
+    free_bytes, _ = torch.cuda.mem_get_info()
+    budget = int(free_bytes * CUDA_WORKING_BYTES_FRACTION) - len(METHODS) * bytes_per
+    if budget < bytes_per:
+        return 0
+    return max(1, min(n_candidates, budget // max(bytes_per, 1)))
+
+
+def mps_batch_size(n_candidates: int, shape: tuple[int, int]) -> int:
+    return max(1, min(n_candidates, MPS_BATCH_BYTES // max(score_matrix_bytes(shape), 1)))
+
+
+def select_fusion_backend(reference: dict, n_candidates: int, requested_device: str) -> dict:
+    shape = reference["shape"]
+    bytes_per = score_matrix_bytes(shape)
+    n_cls = shape[1]
+    cpu_batch = cpu_batch_size(n_candidates, shape)
+    mps_batch = mps_batch_size(n_candidates, shape)
+    mps_fits = (len(METHODS) + 1) * bytes_per <= MPS_BATCH_BYTES
+
+    if requested_device == "cpu":
+        return {"kind": "numpy", "device": torch.device("cpu"), "batch": cpu_batch}
+
+    if requested_device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("Requested cuda, but CUDA is not available")
+        cuda_batch = cuda_batch_size(n_candidates, shape)
+        if cuda_batch <= 0:
+            raise RuntimeError("Requested cuda, but the estimated free GPU memory is not enough for one fusion batch")
+        return {"kind": "torch", "device": torch.device("cuda"), "batch": cuda_batch}
+
+    if requested_device == "mps":
+        if not is_mps_available():
+            raise RuntimeError("Requested mps, but MPS is not available")
+        if not mps_fits:
+            raise RuntimeError("Requested mps, but the estimated working set exceeds the configured MPS budget")
+        return {"kind": "torch", "device": torch.device("mps"), "batch": mps_batch}
+
+    if requested_device != "auto":
+        raise ValueError(f"Unsupported device={requested_device}")
+
+    if torch.cuda.is_available():
+        cuda_batch = cuda_batch_size(n_candidates, shape)
+        if cuda_batch > 0 and n_cls <= CUDA_PROPAGATION_CLASS_LIMIT:
+            return {"kind": "torch", "device": torch.device("cuda"), "batch": cuda_batch}
+
+    if is_mps_available() and mps_fits:
+        return {"kind": "torch", "device": torch.device("mps"), "batch": mps_batch}
+
+    return {"kind": "numpy", "device": torch.device("cpu"), "batch": cpu_batch}
+
+
+def build_torch_descendant_indices(descendant_indices: List[List[int]], device: torch.device) -> List[torch.Tensor | None]:
+    return [
+        torch.as_tensor(children, device=device, dtype=torch.long) if children else None
+        for children in descendant_indices
+    ]
+
+
+def propagate_scores_torch(scores: torch.Tensor, descendant_indices: List[torch.Tensor | None]) -> torch.Tensor:
+    propagated = scores.clone()
+    for parent_index, children in enumerate(descendant_indices):
+        if children is None:
+            continue
+        child_max = torch.index_select(scores, 1, children).amax(dim=1)
+        propagated[:, parent_index] = torch.maximum(propagated[:, parent_index], child_max)
+    return propagated
+
+
 def update_candidates_for_fold(
     reference: dict,
     fold_probs: Dict[str, np.ndarray],
     candidates: List[Dict[str, float]],
     accumulators: List[dict],
+    backend: dict,
     *,
     progress: tqdm | None = None,
 ) -> None:
-    for weights, accumulator in zip(candidates, accumulators):
-        fused = np.zeros(reference["shape"], dtype=np.float32)
-        for method, weight in weights.items():
-            if weight == 0:
-                continue
-            fused += np.float32(weight) * fold_probs[method]
-        propagated_probs = propagate_scores(fused, reference["prop_indices"])
-        update_metric_accumulator(
-            accumulator,
-            reference["labels"],
-            reference["true_per"],
-            reference["has_label"],
-            propagated_probs,
-        )
-        update_progress(progress)
+    # Pre-stack probs: (n_methods, N, C); build weight matrix: (n_candidates, n_methods)
+    weight_matrix = np.array(
+        [[w.get(m, 0.0) for m in METHODS] for w in candidates],
+        dtype=np.float32,
+    )
+    n_cand = len(candidates)
+    batch = backend["batch"]
+    prop_indices = reference["prop_indices"]
+    labels = reference["labels"]
+    true_per = reference["true_per"]
+    has_label = reference["has_label"]
+
+    if backend["kind"] == "torch":
+        probs_stack_np = np.stack([np.asarray(fold_probs[m], dtype=np.float32) for m in METHODS])
+        probs_stack = torch.from_numpy(probs_stack_np).to(backend["device"])
+        weight_matrix_torch = torch.from_numpy(weight_matrix).to(backend["device"])
+        torch_prop_indices = backend["torch_prop_indices"]
+
+        for c0 in range(0, n_cand, batch):
+            c1 = min(c0 + batch, n_cand)
+            fused_batch = torch.einsum("cm,mnk->cnk", weight_matrix_torch[c0:c1], probs_stack)
+            for i in range(c1 - c0):
+                propagated = propagate_scores_torch(fused_batch[i], torch_prop_indices)
+                update_metric_accumulator(
+                    accumulators[c0 + i],
+                    labels,
+                    true_per,
+                    has_label,
+                    propagated.detach().cpu().numpy(),
+                )
+                update_progress(progress)
+        return
+
+    probs_stack = np.stack([np.asarray(fold_probs[m], dtype=np.float32) for m in METHODS])
+    for c0 in range(0, n_cand, batch):
+        c1 = min(c0 + batch, n_cand)
+        fused_batch = np.einsum("cm,mnk->cnk", weight_matrix[c0:c1], probs_stack)
+        for i in range(c1 - c0):
+            propagated = propagate_scores(fused_batch[i], prop_indices)
+            update_metric_accumulator(accumulators[c0 + i], labels, true_per, has_label, propagated)
+            update_progress(progress)
 
 
 def best_candidate(candidates: List[Dict[str, float]], accumulators: List[dict]) -> dict:
@@ -247,6 +406,56 @@ def best_candidate(candidates: List[Dict[str, float]], accumulators: List[dict])
     return best
 
 
+def top_candidates(candidates: List[Dict[str, float]], accumulators: List[dict], k: int) -> List[Dict[str, float]]:
+    scored = [
+        (finalize_metric_accumulator(acc)["fmax"], w)
+        for w, acc in zip(candidates, accumulators)
+    ]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [w for _, w in scored[:k]]
+
+
+def neighborhood_union(centers: List[Dict[str, float]], methods: List[str], step: float, radius: float) -> List[Dict[str, float]]:
+    seen: set = set()
+    result: List[Dict[str, float]] = []
+    for center in centers:
+        for candidate in neighborhood_grid(center, methods, step, radius):
+            key = tuple(candidate[m] for m in methods)
+            if key not in seen:
+                seen.add(key)
+                result.append(candidate)
+    return result
+
+
+def _eval_grid(
+    references: List[dict],
+    oof_dir: Path,
+    aspect: str,
+    candidates: List[Dict[str, float]],
+    *,
+    desc: str,
+    position: int,
+    requested_device: str,
+) -> List[dict]:
+    accumulators = [empty_metric_accumulator() for _ in candidates]
+    backend = select_fusion_backend(references[0], len(candidates), requested_device)
+    if backend["kind"] == "torch":
+        backend["torch_prop_indices"] = build_torch_descendant_indices(references[0]["prop_indices"], backend["device"])
+    print(
+        f"{desc}: device={backend['device'].type} batch={backend['batch']} "
+        f"shape={references[0]['shape'][0]}x{references[0]['shape'][1]}"
+    )
+    progress = tqdm(total=len(candidates) * len(references), desc=desc, dynamic_ncols=True, position=position)
+    try:
+        for ref in references:
+            fold_probs = load_fold_probs(oof_dir, aspect, ref["fold"])
+            update_candidates_for_fold(ref, fold_probs, candidates, accumulators, backend, progress=progress)
+            del fold_probs
+    finally:
+        progress.close()
+    return accumulators
+
+
 def search_aspect(
     oof_dir: Path,
     aspect: str,
@@ -255,34 +464,52 @@ def search_aspect(
     parents: dict,
     *,
     position: int = 0,
+    requested_device: str = "auto",
 ) -> dict:
     references = load_aspect_references(oof_dir, aspect, folds, parents)
-    candidates = simplex_grid(METHODS, step)
-    accumulators = [empty_metric_accumulator() for _ in candidates]
-    progress = tqdm(total=len(candidates) * len(references), desc=f"{aspect} fusion", dynamic_ncols=True, position=position)
+
+    coarse_step = step * 2
     try:
-        for reference in references:
-            fold_probs = load_fold_probs(oof_dir, aspect, reference["fold"])
-            update_candidates_for_fold(
-                reference,
-                fold_probs,
-                candidates,
-                accumulators,
-                progress=progress,
-            )
-            del fold_probs
-        best = best_candidate(candidates, accumulators)
-        if progress is not None:
-            progress.set_postfix(best=f"{best['metrics']['fmax']:.4f}")
-    finally:
-        if progress is not None:
-            progress.close()
+        validate_step(coarse_step)
+        use_two_stage = True
+    except ValueError:
+        use_two_stage = False
+
+    if use_two_stage:
+        # Stage 1: coarse grid
+        coarse_cands = simplex_grid(METHODS, coarse_step)
+        coarse_accs = _eval_grid(
+            references, oof_dir, aspect, coarse_cands, desc=f"{aspect} coarse", position=position, requested_device=requested_device
+        )
+
+        # Stage 2: refine around top 2
+        tops = top_candidates(coarse_cands, coarse_accs, k=2)
+        fine_cands = neighborhood_union(tops, list(METHODS), step, radius=coarse_step)
+        fine_accs = _eval_grid(
+            references, oof_dir, aspect, fine_cands, desc=f"{aspect} refine", position=position, requested_device=requested_device
+        )
+        best = best_candidate(fine_cands, fine_accs)
+    else:
+        candidates = simplex_grid(METHODS, step)
+        accs = _eval_grid(
+            references, oof_dir, aspect, candidates, desc=f"{aspect} fusion", position=position, requested_device=requested_device
+        )
+        best = best_candidate(candidates, accs)
+
     return best
 
 
-def search_aspect_worker(oof_dir: Path, aspect: str, folds: List[int], step: float, obo_path: Path, position: int) -> tuple[str, dict]:
+def search_aspect_worker(
+    oof_dir: Path,
+    aspect: str,
+    folds: List[int],
+    step: float,
+    obo_path: Path,
+    position: int,
+    requested_device: str,
+) -> tuple[str, dict]:
     parents = parse_go_obo(obo_path)
-    return aspect, search_aspect(oof_dir, aspect, folds, step, parents, position=position)
+    return aspect, search_aspect(oof_dir, aspect, folds, step, parents, position=position, requested_device=requested_device)
 
 
 def resolve_jobs(requested_jobs: int, aspect_count: int) -> int:
@@ -300,7 +527,7 @@ def run_aspects_parallel(args: argparse.Namespace, jobs: int) -> Dict[str, dict]
 
     def collect_results(executor) -> None:
         futures = {
-            executor.submit(search_aspect_worker, args.oof_dir, aspect, args.fold, args.step, args.obo, index): aspect
+            executor.submit(search_aspect_worker, args.oof_dir, aspect, args.fold, args.step, args.obo, index, args.device): aspect
             for index, aspect in enumerate(args.aspect)
         }
         for future in as_completed(futures):
@@ -322,7 +549,9 @@ def run_aspects_sequential(args: argparse.Namespace) -> Dict[str, dict]:
     parents = parse_go_obo(args.obo)
     results = {}
     for index, aspect in enumerate(args.aspect):
-        results[aspect] = search_aspect(args.oof_dir, aspect, args.fold, args.step, parents, position=index)
+        results[aspect] = search_aspect(
+            args.oof_dir, aspect, args.fold, args.step, parents, position=index, requested_device=args.device
+        )
     return results
 
 
