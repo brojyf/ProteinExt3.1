@@ -38,7 +38,7 @@ from training.data.go_utils import build_propagation_indices, parse_go_obo, prop
 from training.train import resolve_device
 from training.trainer import predict as predict_batches
 
-DEFAULT_OUTPUT_PATH = ROOT_DIR / "predictions" / "predictions.tsv"
+DEFAULT_OUTPUT_PATH = ROOT_DIR / "predictions" / "ProteinExt3.1.tsv"
 DEFAULT_MODELS_DIR = ROOT_DIR / "models"
 DEFAULT_OBO_PATH = ROOT_DIR / "data" / "go-basic.obo"
 PREDICT_EMBEDDING_DIR = ROOT_DIR / "data" / "embedding"
@@ -62,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--obo", type=Path, default=DEFAULT_OBO_PATH)
     parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
     parser.add_argument("--no-propagate", action="store_true")
+    parser.add_argument("--apply-th", action="store_true", help="Apply fusion threshold to filter predictions")
     return parser.parse_args()
 
 
@@ -106,11 +107,8 @@ def normalize_method(method: str) -> str:
     return {"esm2": "esm2_last", "t5": "prott5"}.get(method, method)
 
 
-def checkpoint_paths(method: str, aspect: str, fold: int | None = None) -> List[Path]:
-    if fold is not None:
-        path = DEFAULT_MODELS_DIR / f"{method}_{aspect}_fold_{fold}.pt"
-        return [path] if path.exists() else []
-    return sorted(DEFAULT_MODELS_DIR.glob(f"{method}_{aspect}_fold_*.pt"))
+def checkpoint_path(method: str, aspect: str) -> Path:
+    return DEFAULT_MODELS_DIR / f"{method}_{aspect}.pt"
 
 
 def model_args_from_checkpoint(payload: dict) -> SimpleNamespace:
@@ -131,33 +129,21 @@ def run_chain_inference(
     sequences_by_pid: Dict[str, str],
     batch_size: int,
     device: torch.device,
-    fold: int | None = None,
 ) -> dict:
-    paths = checkpoint_paths(method, aspect, fold)
-    if not paths:
-        fold_text = f" fold={fold}" if fold is not None else ""
-        raise FileNotFoundError(f"No {method} checkpoints found for aspect={aspect}{fold_text} in {DEFAULT_MODELS_DIR}")
+    path = checkpoint_path(method, aspect)
+    if not path.exists():
+        raise FileNotFoundError(f"Missing checkpoint for method={method} aspect={aspect}: {path}")
     pids = sorted(sequences_by_pid)
     features = {pid: build_sequence_protein_features(seq) for pid, seq in sequences_by_pid.items()}
     dataset = MultiEmbeddingDataset(pids, None, PREDICT_EMBEDDING_DIR, features, chain=method)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_multi_embedding_batch)
-    fold_probs = []
-    classes = None
-    result_pids = None
-    for path in paths:
-        payload = torch.load(path, map_location="cpu", weights_only=False)
-        fold_classes = np.asarray(payload["classes"])
-        if classes is None:
-            classes = fold_classes
-        elif not np.array_equal(classes, fold_classes):
-            raise ValueError(f"Class mismatch in checkpoint {path}")
-        model = MODEL_BUILDERS[method](model_args_from_checkpoint(payload), len(fold_classes))
-        model.load_state_dict(payload["model_state_dict"])
-        model.to(device)
-        result = predict_batches(model, loader, device, f"predict {path.stem}")
-        result_pids = result["pids"]
-        fold_probs.append(result["probs"])
-    return {"pids": result_pids, "classes": classes, "probs": np.mean(fold_probs, axis=0).astype(np.float32)}
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    classes = np.asarray(payload["classes"])
+    model = MODEL_BUILDERS[method](model_args_from_checkpoint(payload), len(classes))
+    model.load_state_dict(payload["model_state_dict"])
+    model.to(device)
+    result = predict_batches(model, loader, device, f"predict {path.stem}")
+    return {"pids": result["pids"], "classes": classes, "probs": result["probs"].astype(np.float32)}
 
 
 def load_fusion_weights(path: Path, aspect: str) -> dict:
@@ -172,12 +158,6 @@ def load_fusion_weights(path: Path, aspect: str) -> dict:
         "prott5": float(item.get("w_t5", 0.0)),
         "blast": float(item.get("w_blast", 0.0)),
         "threshold": float(item.get("thr", 0.5)),
-        "folds": {
-            "esm2_last": int(item["fold_last"]),
-            "esm2_l20": int(item["fold_l20"]),
-            "prott5": int(item["fold_t5"]),
-            "blast": int(item["fold_blast"]),
-        },
     }
 
 
@@ -232,12 +212,15 @@ def run_blast_inference(input_fasta: Path, pids: np.ndarray, classes: np.ndarray
     return transfer_blast_scores(run_blast_search(input_fasta, cpu), labels_df, pids, classes, aspect)
 
 
-def collect_rows(pids: np.ndarray, classes: np.ndarray, probs: np.ndarray) -> List[tuple[str, str, float]]:
+def collect_rows(pids: np.ndarray, classes: np.ndarray, probs: np.ndarray, threshold: float | None = None) -> List[tuple[str, str, float]]:
     rows: List[tuple[str, str, float]] = []
     for row_index, pid in enumerate(pids.tolist()):
         order = np.argsort(probs[row_index])[::-1]
         for col in order.tolist():
-            rows.append((pid, str(classes[col]), float(probs[row_index, col])))
+            score = float(probs[row_index, col])
+            if threshold is not None and score < threshold:
+                break
+            rows.append((pid, str(classes[col]), score))
     return rows
 
 
@@ -250,7 +233,16 @@ def write_predictions(path: Path, rows: Sequence[tuple[str, str, float]]) -> Non
 
 
 def component_output_path(output_path: Path, suffix: str) -> Path:
-    return output_path.with_name(f"{output_path.stem}_{suffix}{output_path.suffix}")
+    NAME_MAP = {
+        "last": "ESM2",
+        "l20": "ESM2-L20",
+        "t5": "ProtT5",
+        "blast": "BLAST"
+    }
+
+    return output_path.with_name(
+        f"{output_path.stem}-{NAME_MAP.get(suffix, suffix)}{output_path.suffix}"
+    )
 
 
 def main() -> None:
@@ -286,7 +278,7 @@ def main() -> None:
                     raise RuntimeError("BLAST hits were not initialized")
                 weights = load_fusion_weights(args.weights, aspect)
                 component_results = {
-                    chain: run_chain_inference(chain, aspect, sequences, args.batch_size, device, weights["folds"][chain])
+                    chain: run_chain_inference(chain, aspect, sequences, args.batch_size, device)
                     for chain in ("esm2_last", "esm2_l20", "prott5")
                 }
                 if not component_results:
@@ -320,7 +312,8 @@ def main() -> None:
         if method == "fusion":
             for name, values in component_probs.items():
                 component_rows[name].extend(collect_rows(pids, classes, values))
-        rows.extend(collect_rows(pids, classes, probs))
+        th = weights["threshold"] if method == "fusion" and args.apply_th else None
+        rows.extend(collect_rows(pids, classes, probs, threshold=th))
     write_predictions(args.output, rows)
     for suffix, method_rows in component_rows.items():
         path = component_output_path(args.output, suffix)

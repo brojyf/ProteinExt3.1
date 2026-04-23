@@ -22,7 +22,8 @@ data/embedding/*
 data/test.fasta
 
 # Models
-models*
+all_models/*
+models/*
 !models/fusion_weights.csv
 
 # Predictions

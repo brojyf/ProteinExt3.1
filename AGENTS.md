@@ -107,3 +107,6 @@ For any non-trivial design, explicitly state:
 - ❌ Deleting code you don’t understand
 - ❌ Claiming correctness without verification
 - ❌ Assuming user intent without confirmation
+
+## Reference
+- [Andrej Karpathy's Skills](https://github.com/forrestchang/andrej-karpathy-skills)
