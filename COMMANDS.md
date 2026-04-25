@@ -3,9 +3,10 @@ Check the [training/README.md](training/README.md) and [data/README.md](data/REA
 1. [Make CV](#make-cv)
 2. [Embedding](#embedding)
 3. [Training](#training)
-4. [Inference](#inference)
-5. [Comparison](#comparison)
-6. [Exploration](#exploration)
+4. [Late Fusion](#late-fusion)
+5. [Inference](#inference)
+6. [Comparison](#comparison)
+7. [Exploration](#exploration)
 
 
 ## Make CV
@@ -65,6 +66,21 @@ Optional:
 - `--oof-dir`: OOF output directory; default `training/oof`
 - `--no-crafted`: disable handcrafted protein features; default crafted features enabled
 - `--lr-scheduler`: `cosine` or `plateau`; default `cosine`
+
+## Late Fusion
+```bash
+python training/late_fusion.py
+```
+
+Optional:
+- `--aspect`: one or more GO aspects; choices `P`, `F`, `C`; default `P F C`
+- `--fold`: one or more fold ids; default `0 1 2 3 4`
+- `--oof-dir`: OOF prediction directory; default `training/oof`
+- `--output`: output fusion weights CSV path; default `models_raw/latefusion_new.csv`
+- `--obo`: GO OBO path; default `data/go-basic.obo`
+- `--step`: simplex grid search step size (must divide 1.0); default `0.1`
+- `--device`: `auto`, `cuda`, `mps`, or `cpu`; default `auto`
+- `--jobs`: parallel aspect jobs; `0` uses one job per requested aspect; default `0`
 
 ## Inference
 ```bash
