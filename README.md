@@ -35,3 +35,17 @@ python training/late_fusion.py --aspect P F C --methods esm2_last esm2_l20 prott
 ## weights: models/fusion_weights.csv
 python predict.py
 ```
+
+  token_embeddings
+    -> mean pool
+    -> max pool
+  protein_features
+    -> LayerNorm -> Linear(63,128) -> GELU -> Dropout -> Linear(128,256)
+
+  concat
+    -> LayerNorm
+    -> Linear(input_dim, hidden_dim)
+    -> residual block: x + [LayerNorm -> GELU -> Dropout -> Linear(hidden_dim,
+  hidden_dim)]
+    -> LayerNorm -> GELU -> Dropout -> Linear(hidden_dim, bottleneck)
+    -> LayerNorm -> GELU -> Dropout -> Linear(bottleneck, num_classes)

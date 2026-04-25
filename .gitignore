@@ -2,9 +2,9 @@
 .DS_Store
 .claude
 AGENTS.md
-
-# Python Cache
 __pycache__/
+Paper.pages
+
 
 # Training Data
 training/data/cv
@@ -20,6 +20,7 @@ data/blast/*
 data/embedding/*
 !data/embedding/.gitkeep
 data/test.fasta
+data/testsuperset.fasta
 
 # Models
 all_models/*
