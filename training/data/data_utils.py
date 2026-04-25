@@ -255,6 +255,7 @@ class MultiEmbeddingDataset(Dataset):
         self.pooling = pooling
         self.use_crafted_features = use_crafted_features
         self._shard_cache: Dict[Path, Dict[str, torch.Tensor]] = {}
+        self._index_cache: Dict[Path, Dict[str, str]] = {}
 
     def __len__(self) -> int:
         return len(self.pids)
@@ -276,10 +277,13 @@ class MultiEmbeddingDataset(Dataset):
 
     def _load_sharded_pooled_embedding(self, pid: str, layer_dir: Path) -> torch.Tensor:
         index_path = layer_dir / "index.json"
-        if not index_path.exists():
-            raise FileNotFoundError(f"Missing embedding for {pid}: {layer_dir / (pid + '.pt')} or {index_path}")
-        with index_path.open("r", encoding="utf-8") as handle:
-            index = json.load(handle)
+        index = self._index_cache.get(index_path)
+        if index is None:
+            if not index_path.exists():
+                raise FileNotFoundError(f"Missing embedding for {pid}: {layer_dir / (pid + '.pt')} or {index_path}")
+            with index_path.open("r", encoding="utf-8") as handle:
+                index = json.load(handle)
+            self._index_cache[index_path] = index
         shard_name = index.get(pid)
         if shard_name is None:
             raise FileNotFoundError(f"Missing embedding for {pid} in shard index: {index_path}")
