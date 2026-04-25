@@ -43,7 +43,7 @@ from training.trainer import compute_multilabel_metrics, predict, train_one_epoc
 
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "models_raw"
 DEFAULT_OOF_DIR = ROOT_DIR / "training" / "oof"
-DEFAULT_OBO_PATH = ROOT_DIR / "data" / "go-basic.obo"
+DEFAULT_OBO_PATH = ROOT_DIR / "training" / "data" / "go-basic.obo"
 DEFAULT_ESM2_FINAL_LAYER = 33
 
 
