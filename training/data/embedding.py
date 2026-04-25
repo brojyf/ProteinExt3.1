@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import inspect
+import json
 import re
 import sys
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, List, Sequence
 
 import torch
 from tqdm.auto import tqdm
@@ -15,22 +17,29 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from training.data.data_utils import collect_unique_sequences_from_folds
+from training.data.data_utils import load_fasta_sequences
 
 DEFAULT_EMBEDDING_DIR = Path(__file__).resolve().parent / "embedding"
-DEFAULT_FOLDS = [0, 1, 2, 3, 4]
+DEFAULT_RAW_FASTA = Path(__file__).resolve().parent / "raw" / "training.fasta"
+DEFAULT_BATCH_SIZE = 8
 DEFAULT_MAX_LENGTH = 1024
 DEFAULT_T5_NAME = "Rostlab/prot_t5_xl_half_uniref50-enc"
 DEFAULT_ESM2_NAME = "facebook/esm2_t33_650M_UR50D"
 DEFAULT_ESM2_INTERMEDIATE_LAYER = 20
-DEFAULT_POOLING = "mean"
+DEFAULT_POOLING = "both"
+DEFAULT_SHARD_SIZE = 4096
 
 
 def add_embedding_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--plm", required=True, choices=["esm2", "t5"])
-    parser.add_argument("--batch-size", required=True, type=int)
+    parser.add_argument("--plm", required=True, choices=["esm2", "prott5"])
+    parser.add_argument("--fasta", type=Path, default=DEFAULT_RAW_FASTA)
+    parser.add_argument("--out-dir", dest="embedding_dir", type=Path, default=DEFAULT_EMBEDDING_DIR)
+    parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto")
+    parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH)
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--layers", required=True, type=int, nargs="+")
-    parser.add_argument("--pooling", required=True, choices=["max", "mean", "both"])
+    parser.add_argument("--pooling", choices=["max", "mean", "both"], default=DEFAULT_POOLING)
+    parser.add_argument("--shard-size", type=int, default=DEFAULT_SHARD_SIZE)
 
 
 def parse_args() -> argparse.Namespace:
@@ -103,10 +112,6 @@ def save_embedding_tensor(path: Path, tensor: torch.Tensor) -> None:
     torch.save(tensor, path)
 
 
-def esm2_layer_dir(layer_index: int) -> str:
-    return f"layer{layer_index}"
-
-
 def hidden_state_layer_dir(layer_index: int) -> str:
     return str(layer_index)
 
@@ -117,6 +122,8 @@ def resolve_layer_indices(layer_indices: Sequence[int]) -> List[int]:
     for layer_index in layer_indices:
         if layer_index < 0:
             raise ValueError(f"Layer index must be non-negative, got {layer_index}.")
+        if resolved and layer_index < resolved[-1]:
+            raise ValueError("Layer indices must be in ascending order because inference stops at the last requested layer.")
         if layer_index in seen:
             continue
         seen.add(layer_index)
@@ -152,6 +159,106 @@ def pool_hidden_state(hidden_state: torch.Tensor, attention_mask: torch.Tensor, 
     raise ValueError(f"Unsupported pooling mode: {pooling_name}")
 
 
+def shard_index_path(layer_dir: Path) -> Path:
+    return layer_dir / "index.json"
+
+
+def load_shard_index(layer_dir: Path) -> Dict[str, str]:
+    path = shard_index_path(layer_dir)
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as handle:
+        loaded = json.load(handle)
+    if not isinstance(loaded, dict):
+        raise TypeError(f"Expected shard index object at {path}")
+    return {str(pid): str(shard_name) for pid, shard_name in loaded.items()}
+
+
+def save_shard_index(layer_dir: Path, index: Dict[str, str]) -> None:
+    with shard_index_path(layer_dir).open("w", encoding="utf-8") as handle:
+        json.dump(index, handle, indent=2, sort_keys=True)
+
+
+def pooled_embedding_exists(
+    output_dir: Path,
+    plm: str,
+    pooling_name: str,
+    layer_index: int,
+    pid: str,
+    shard_index: Dict[str, str] | None = None,
+) -> bool:
+    layer_dir = output_dir / plm / pooling_name / hidden_state_layer_dir(layer_index)
+    if (layer_dir / f"{pid}.pt").exists():
+        return True
+    index = shard_index if shard_index is not None else load_shard_index(layer_dir)
+    shard_name = index.get(pid)
+    return shard_name is not None and (layer_dir / shard_name).exists()
+
+
+class ShardEmbeddingWriter:
+    def __init__(self, output_dir: Path, shard_size: int) -> None:
+        if shard_size <= 0:
+            raise ValueError(f"shard_size must be positive, got {shard_size}")
+        self.output_dir = output_dir
+        self.shard_size = shard_size
+        self.indices: Dict[Path, Dict[str, str]] = {}
+        self.buffers: Dict[Path, Dict[str, torch.Tensor]] = {}
+        self.next_shard_ids: Dict[Path, int] = {}
+
+    def _layer_dir(self, plm: str, pooling_name: str, layer_index: int) -> Path:
+        return self.output_dir / plm / pooling_name / hidden_state_layer_dir(layer_index)
+
+    def _ensure_layer(self, layer_dir: Path) -> None:
+        if layer_dir in self.indices:
+            return
+        layer_dir.mkdir(parents=True, exist_ok=True)
+        self.indices[layer_dir] = load_shard_index(layer_dir)
+        shard_ids = []
+        for path in layer_dir.glob("shard_*.pt"):
+            try:
+                shard_ids.append(int(path.stem.removeprefix("shard_")))
+            except ValueError:
+                continue
+        self.next_shard_ids[layer_dir] = max(shard_ids, default=-1) + 1
+        self.buffers[layer_dir] = {}
+
+    def add_batch(
+        self,
+        *,
+        plm: str,
+        pooling_name: str,
+        layer_index: int,
+        batch_pids: Sequence[str],
+        pooled_batch: torch.Tensor,
+    ) -> None:
+        layer_dir = self._layer_dir(plm, pooling_name, layer_index)
+        self._ensure_layer(layer_dir)
+        index = self.indices[layer_dir]
+        buffer = self.buffers[layer_dir]
+        for tensor_index, pid in enumerate(batch_pids):
+            if pid in index or pid in buffer:
+                continue
+            buffer[pid] = pooled_batch[tensor_index].clone()
+            if len(buffer) >= self.shard_size:
+                self.flush_layer(layer_dir)
+
+    def flush_layer(self, layer_dir: Path) -> None:
+        buffer = self.buffers[layer_dir]
+        if not buffer:
+            return
+        shard_name = f"shard_{self.next_shard_ids[layer_dir]:05d}.pt"
+        torch.save(dict(buffer), layer_dir / shard_name)
+        for pid in buffer:
+            self.indices[layer_dir][pid] = shard_name
+        buffer.clear()
+        self.next_shard_ids[layer_dir] += 1
+        save_shard_index(layer_dir, self.indices[layer_dir])
+
+    def close(self) -> None:
+        for layer_dir in list(self.buffers):
+            self.flush_layer(layer_dir)
+
+
 def save_pooled_batch(
     *,
     output_dir: Path,
@@ -161,14 +268,17 @@ def save_pooled_batch(
     hidden_state: torch.Tensor,
     attention_mask: torch.Tensor,
     batch_pids: Sequence[str],
+    shard_writer: ShardEmbeddingWriter,
 ) -> None:
     for pooling_name in pooling_names:
         pooled_batch = pool_hidden_state(hidden_state, attention_mask, pooling_name).detach().cpu().to(torch.float16)
-        for index, pid in enumerate(batch_pids):
-            output_path = output_dir / plm / pooling_name / hidden_state_layer_dir(layer_index) / f"{pid}.pt"
-            if output_path.exists():
-                continue
-            save_embedding_tensor(output_path, pooled_batch[index].clone())
+        shard_writer.add_batch(
+            plm=plm,
+            pooling_name=pooling_name,
+            layer_index=layer_index,
+            batch_pids=batch_pids,
+            pooled_batch=pooled_batch,
+        )
 
 
 def print_embedding_device_summary(device: torch.device) -> None:
@@ -179,6 +289,19 @@ def embedding_autocast(device: torch.device):
     if device.type == "cuda":
         return torch.amp.autocast("cuda")
     return nullcontext()
+
+
+def create_esm2_attention_masks(model, attention_mask: torch.Tensor, hidden_states: torch.Tensor):
+    kwargs = {
+        "attention_mask": attention_mask,
+        "encoder_attention_mask": None,
+        "embedding_output": hidden_states,
+        "encoder_hidden_states": None,
+        "past_key_values": None,
+    }
+    if "cache_position" in inspect.signature(model._create_attention_masks).parameters:
+        kwargs["cache_position"] = torch.arange(hidden_states.shape[1], device=hidden_states.device)
+    return model._create_attention_masks(**kwargs)
 
 
 @torch.inference_mode()
@@ -192,6 +315,7 @@ def extract_esm2_embeddings(
     device: torch.device,
     layer_indices: Sequence[int] | None = None,
     pooling: str = DEFAULT_POOLING,
+    shard_size: int = DEFAULT_SHARD_SIZE,
 ) -> None:
     AutoTokenizer, EsmModel, _, _, _ = _require_transformers()
     resolved_layers = resolve_layer_indices(
@@ -203,18 +327,33 @@ def extract_esm2_embeddings(
     model = EsmModel.from_pretrained(pretrained_name, add_pooling_layer=False).to(device)
     model.eval()
     _validate_hidden_state_layers(resolved_layers, model.config.num_hidden_layers, "esm2")
-    max_layer_index = max(resolved_layers)
+    max_layer_index = resolved_layers[-1]
+    shard_writer = ShardEmbeddingWriter(output_dir, shard_size)
 
     for pooling_name in pooling_names:
         for layer_index in resolved_layers:
             (output_dir / "esm2" / pooling_name / hidden_state_layer_dir(layer_index)).mkdir(
                 parents=True, exist_ok=True
             )
+    shard_indices = {
+        (pooling_name, layer_index): load_shard_index(
+            output_dir / "esm2" / pooling_name / hidden_state_layer_dir(layer_index)
+        )
+        for pooling_name in pooling_names
+        for layer_index in resolved_layers
+    }
 
     pids = []
     for pid in sorted(sequences_by_pid):
         if any(
-            not (output_dir / "esm2" / pooling_name / hidden_state_layer_dir(layer_index) / f"{pid}.pt").exists()
+            not pooled_embedding_exists(
+                output_dir,
+                "esm2",
+                pooling_name,
+                layer_index,
+                pid,
+                shard_indices.get((pooling_name, layer_index)),
+            )
             for pooling_name in pooling_names
             for layer_index in resolved_layers
         ):
@@ -242,15 +381,7 @@ def extract_esm2_embeddings(
                 attention_mask=attention_mask,
                 position_ids=tokens.get("position_ids"),
             )
-            encoder_attention_mask = None
-            layer_attention_mask, encoder_attention_mask = model._create_attention_masks(
-                attention_mask=attention_mask,
-                encoder_attention_mask=encoder_attention_mask,
-                embedding_output=hidden_states,
-                encoder_hidden_states=None,
-                cache_position=torch.arange(hidden_states.shape[1], device=hidden_states.device),
-                past_key_values=None,
-            )
+            layer_attention_mask, encoder_attention_mask = create_esm2_attention_masks(model, attention_mask, hidden_states)
 
             if 0 in resolved_layers:
                 save_pooled_batch(
@@ -261,6 +392,7 @@ def extract_esm2_embeddings(
                     hidden_state=hidden_states,
                     attention_mask=attention_mask,
                     batch_pids=batch_pids,
+                    shard_writer=shard_writer,
                 )
 
             if max_layer_index == 0:
@@ -284,9 +416,11 @@ def extract_esm2_embeddings(
                         hidden_state=hidden_states,
                         attention_mask=attention_mask,
                         batch_pids=batch_pids,
+                        shard_writer=shard_writer,
                     )
                 if layer_number >= max_layer_index:
                     break
+    shard_writer.close()
 
 
 @torch.inference_mode()
@@ -300,6 +434,7 @@ def extract_t5_embeddings(
     device: torch.device,
     layer_indices: Sequence[int] | None = None,
     pooling: str = DEFAULT_POOLING,
+    shard_size: int = DEFAULT_SHARD_SIZE,
 ) -> None:
     _ensure_prott5_dependencies()
     _, _, T5EncoderModel, T5Tokenizer, create_bidirectional_mask = _require_transformers()
@@ -315,18 +450,33 @@ def extract_t5_embeddings(
         model = model.float()
     model.eval()
     _validate_hidden_state_layers(resolved_layers, model.config.num_layers, "t5")
-    max_layer_index = max(resolved_layers)
+    max_layer_index = resolved_layers[-1]
+    shard_writer = ShardEmbeddingWriter(output_dir, shard_size)
 
     for pooling_name in pooling_names:
         for layer_index in resolved_layers:
             (output_dir / "t5" / pooling_name / hidden_state_layer_dir(layer_index)).mkdir(
                 parents=True, exist_ok=True
             )
+    shard_indices = {
+        (pooling_name, layer_index): load_shard_index(
+            output_dir / "t5" / pooling_name / hidden_state_layer_dir(layer_index)
+        )
+        for pooling_name in pooling_names
+        for layer_index in resolved_layers
+    }
 
     pids = []
     for pid in sorted(sequences_by_pid):
         if any(
-            not (output_dir / "t5" / pooling_name / hidden_state_layer_dir(layer_index) / f"{pid}.pt").exists()
+            not pooled_embedding_exists(
+                output_dir,
+                "t5",
+                pooling_name,
+                layer_index,
+                pid,
+                shard_indices.get((pooling_name, layer_index)),
+            )
             for pooling_name in pooling_names
             for layer_index in resolved_layers
         ):
@@ -367,6 +517,7 @@ def extract_t5_embeddings(
                     hidden_state=hidden_states,
                     attention_mask=attention_mask,
                     batch_pids=batch_pids,
+                    shard_writer=shard_writer,
                 )
 
             if max_layer_index == 0:
@@ -400,16 +551,18 @@ def extract_t5_embeddings(
                         hidden_state=hidden_states,
                         attention_mask=attention_mask,
                         batch_pids=batch_pids,
+                        shard_writer=shard_writer,
                     )
                 if layer_number >= max_layer_index:
                     break
+    shard_writer.close()
 
 
 def run_embedding_extraction(args) -> None:
     if args.plm is None:
-        raise RuntimeError("Embedding extraction requires `--plm esm2` or `--plm t5`.")
+        raise RuntimeError("Embedding extraction requires `--plm esm2` or `--plm prott5`.")
 
-    sequences_by_pid = collect_unique_sequences_from_folds(args.fold)
+    sequences_by_pid = load_fasta_sequences(args.fasta)
     print(f"Embedding extraction | plm={args.plm} | proteins={len(sequences_by_pid)}")
     print_embedding_device_summary(args.device)
 
@@ -423,8 +576,9 @@ def run_embedding_extraction(args) -> None:
             device=args.device,
             layer_indices=args.layers,
             pooling=args.pooling,
+            shard_size=args.shard_size,
         )
-    elif args.plm == "t5":
+    elif args.plm == "prott5":
         extract_t5_embeddings(
             sequences_by_pid=sequences_by_pid,
             output_dir=args.embedding_dir,
@@ -434,6 +588,7 @@ def run_embedding_extraction(args) -> None:
             device=args.device,
             layer_indices=args.layers,
             pooling=args.pooling,
+            shard_size=args.shard_size,
         )
     else:
         raise ValueError(f"Unsupported PLM for embedding extraction: {args.plm}")
@@ -441,10 +596,7 @@ def run_embedding_extraction(args) -> None:
 
 def main() -> None:
     args = parse_args()
-    args.fold = list(DEFAULT_FOLDS)
-    args.embedding_dir = DEFAULT_EMBEDDING_DIR
-    args.max_length = DEFAULT_MAX_LENGTH
-    args.device = resolve_device("auto")
+    args.device = resolve_device(args.device)
     run_embedding_extraction(args)
 
 

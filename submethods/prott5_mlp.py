@@ -19,4 +19,6 @@ def build_model(args, num_classes: int) -> nn.Module:
         hidden_dim=args.hidden_dim,
         bottleneck=args.bottleneck,
         dropout=args.dropout,
+        pooling=args.pooling,
+        use_crafted_features=args.use_crafted_features,
     )

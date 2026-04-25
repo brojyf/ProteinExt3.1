@@ -1,32 +1,31 @@
-# Local Machine
+# General
+AGENTS.md
 .DS_Store
 .claude
-AGENTS.md
 __pycache__/
 Paper.pages
 
-
-# Training Data
-training/data/cv
-training/data/embedding
-training/data/raw
-training/oof
-training/data/protein_features
-training/data/label_space
-
-# Inference Data
-data/blast/*
-!data/blast/.gitkeep
-data/embedding/*
-!data/embedding/.gitkeep
-data/test.fasta
-data/testsuperset.fasta
-
 # Models
-all_models/*
+all_models/
 models/*
 !models/fusion_weights.csv
 
-# Predictions
+# Prediction Data
+data/*
+!data/README.md
+!data/embedding/unshard.py
 predictions/*
 !predictions/.gitkeep
+
+# Training Data
+training/oof/
+training/data/cv/
+training/data/embedding/
+training/data/label_space/
+training/data/protein_features/
+training/data/raw/
+training/data/go-basic.obo
+
+# TEMP
+comparison/
+exploration/

@@ -30,13 +30,13 @@ from training.data.data_utils import (
     load_protein_features_cache,
 )
 from training.data.embedding import (
-    DEFAULT_ESM2_INTERMEDIATE_LAYER,
     DEFAULT_ESM2_NAME,
     DEFAULT_MAX_LENGTH,
     DEFAULT_T5_NAME,
-    esm2_layer_dir,
     extract_esm2_embeddings,
     extract_t5_embeddings,
+    load_shard_index,
+    pooled_embedding_exists,
 )
 from training.data.go_utils import parse_go_obo
 from training.trainer import compute_multilabel_metrics, predict, train_one_epoch
@@ -44,20 +44,53 @@ from training.trainer import compute_multilabel_metrics, predict, train_one_epoc
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "models"
 DEFAULT_OOF_DIR = ROOT_DIR / "training" / "oof"
 DEFAULT_OBO_PATH = ROOT_DIR / "data" / "go-basic.obo"
+DEFAULT_ESM2_FINAL_LAYER = 33
+
+
+def normalize_method(method: str) -> str:
+    aliases = {
+        "esm2": f"esm2-{DEFAULT_ESM2_FINAL_LAYER}",
+        "esm2_last": f"esm2-{DEFAULT_ESM2_FINAL_LAYER}",
+        "esm2_l20": "esm2-20",
+        "t5": "prott5",
+    }
+    normalized = aliases.get(method, method)
+    if normalized.startswith("esm2-"):
+        layer = normalized.removeprefix("esm2-")
+        if not layer.isdigit():
+            raise ValueError(f"ESM2 method must be esm2-<layer>, got {method}")
+        return normalized
+    if normalized in {"prott5", "blast"}:
+        return normalized
+    raise ValueError(f"Unsupported method: {method}")
+
+
+def esm2_method_layer(method: str) -> int | None:
+    if not method.startswith("esm2-"):
+        return None
+    return int(method.removeprefix("esm2-"))
+
+
+def run_name(args: SimpleNamespace, fold_name: str) -> str:
+    crafted = "crafted" if bool(args.use_crafted_features) else "no-crafted"
+    scheduler = "cos" if args.lr_scheduler == "cosine" else "plateau"
+    return f"{args.method}_{args.aspect}_{args.pooling}_{crafted}_{scheduler}_{fold_name}"
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train neural and BLAST GO predictors")
-    parser.add_argument("--method", choices=["esm2_last", "esm2_l20", "prott5", "blast", "esm2", "t5"], default=None)
+    parser.add_argument("--method", default=None, help="Training method, e.g. esm2-33, esm2-20, prott5, or blast")
     parser.add_argument("--aspect", choices=["P", "F", "C"], default=None)
     parser.add_argument("--fold", type=int, nargs="+", default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default=None)
-    parser.add_argument("--min-count", type=int, default=None)
-    parser.add_argument("--blast-threads", type=int, default=None)
-    parser.add_argument("--cos-lr", action="store_true", help="Use cosine learning rate schedule")
-    parser.add_argument("--obo", type=Path, default=DEFAULT_OBO_PATH)
+    parser.add_argument("--threads", type=int, default=None)
+    parser.add_argument("--pooling", choices=["both", "mean", "max"], default=None)
+    parser.add_argument("--model-dir", type=Path, default=None)
+    parser.add_argument("--oof-dir", type=Path, default=None)
+    parser.add_argument("--no-crafted", action="store_true", help="Disable handcrafted protein features")
+    parser.add_argument("--lr-scheduler", choices=["cosine", "plateau"], default="cosine")
     return parser.parse_args()
 
 
@@ -81,43 +114,73 @@ def resolve_device(requested: str) -> torch.device:
 
 def apply_cli_overrides(config: Dict[str, object], args: argparse.Namespace) -> Dict[str, object]:
     resolved = dict(config)
-    for key in ("method", "aspect", "fold", "epochs", "device", "min_count"):
+    for key in ("method", "aspect", "fold", "epochs", "device", "pooling"):
         value = getattr(args, key, None)
         if value is not None:
             resolved[key] = value
     if args.batch_size is not None:
         resolved["batch_size"] = args.batch_size
-    if args.blast_threads is not None:
-        resolved["blast_threads"] = args.blast_threads
-    if args.cos_lr:
-        resolved["lr_scheduler"] = "cosine"
-    aliases = {"esm2": "esm2_last", "t5": "prott5"}
-    resolved["method"] = aliases.get(str(resolved["method"]), resolved["method"])
+    if args.threads is not None:
+        resolved["blast_threads"] = args.threads
+    if args.model_dir is not None:
+        resolved["output_dir"] = args.model_dir
+    if args.oof_dir is not None:
+        resolved["oof_dir"] = args.oof_dir
+    if args.no_crafted:
+        resolved["use_crafted_features"] = False
+    if args.lr_scheduler is not None:
+        resolved["lr_scheduler"] = args.lr_scheduler
+    resolved["method"] = normalize_method(str(resolved["method"]))
     return resolved
 
 
 def namespace_from_config(config: Dict[str, object]) -> SimpleNamespace:
     args = SimpleNamespace(**config)
     args.device = resolve_device(str(args.device))
-    args.output_dir = DEFAULT_OUTPUT_DIR
-    args.oof_dir = DEFAULT_OOF_DIR
+    args.output_dir = Path(getattr(args, "output_dir", DEFAULT_OUTPUT_DIR))
+    args.oof_dir = Path(getattr(args, "oof_dir", DEFAULT_OOF_DIR))
     return args
 
 
-def _embedding_exists(pid: str, plm: str, layer: str) -> bool:
-    return (EMBEDDING_DIR / plm / layer / f"{pid}.pt").exists()
+def _pooling_names(pooling: str) -> list[str]:
+    return ["mean", "max"] if pooling == "both" else [pooling]
 
 
-def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device: torch.device, method: str) -> None:
+def _embedding_exists(
+    pid: str,
+    plm: str,
+    layer: str,
+    pooling: str,
+    shard_indices: Dict[str, Dict[str, str]] | None = None,
+) -> bool:
+    indices = shard_indices or {
+        pooling_name: load_shard_index(EMBEDDING_DIR / plm / pooling_name / layer)
+        for pooling_name in _pooling_names(pooling)
+    }
+    return all(
+        pooled_embedding_exists(EMBEDDING_DIR, plm, pooling_name, int(layer), pid, indices[pooling_name])
+        for pooling_name in _pooling_names(pooling)
+    )
+
+
+def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device: torch.device, method: str, pooling: str) -> None:
     needs_t5 = method == "prott5"
-    if method == "esm2_last":
-        missing_esm2 = [pid for pid in sequences_by_pid if not _embedding_exists(pid, "esm2", "last")]
-    elif method == "esm2_l20":
-        layer = esm2_layer_dir(DEFAULT_ESM2_INTERMEDIATE_LAYER)
-        missing_esm2 = [pid for pid in sequences_by_pid if not _embedding_exists(pid, "esm2", layer)]
-    else:
-        missing_esm2 = []
-    missing_t5 = [pid for pid in sequences_by_pid if not _embedding_exists(pid, "t5", "last")] if needs_t5 else []
+    esm2_layer = esm2_method_layer(method)
+    esm2_indices = {
+        pooling_name: load_shard_index(EMBEDDING_DIR / "esm2" / pooling_name / str(esm2_layer))
+        for pooling_name in _pooling_names(pooling)
+    } if esm2_layer is not None else None
+    t5_indices = {
+        pooling_name: load_shard_index(EMBEDDING_DIR / "t5" / pooling_name / "0")
+        for pooling_name in _pooling_names(pooling)
+    } if needs_t5 else None
+    missing_esm2 = [
+        pid for pid in sequences_by_pid
+        if esm2_layer is not None and not _embedding_exists(pid, "esm2", str(esm2_layer), pooling, esm2_indices)
+    ]
+    missing_t5 = [
+        pid for pid in sequences_by_pid if not _embedding_exists(pid, "t5", "0", pooling, t5_indices)
+    ] if needs_t5 else []
     if missing_esm2:
         extract_esm2_embeddings(
             sequences_by_pid={pid: sequences_by_pid[pid] for pid in missing_esm2},
@@ -126,7 +189,8 @@ def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device:
             batch_size=batch_size,
             max_length=DEFAULT_MAX_LENGTH,
             device=device,
-            layer_index=DEFAULT_ESM2_INTERMEDIATE_LAYER,
+            layer_indices=[esm2_layer] if esm2_layer is not None else None,
+            pooling=pooling,
         )
     if missing_t5:
         extract_t5_embeddings(
@@ -136,6 +200,7 @@ def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device:
             batch_size=batch_size,
             max_length=DEFAULT_MAX_LENGTH,
             device=device,
+            pooling=pooling,
         )
 
 
@@ -165,10 +230,12 @@ def save_oof(prefix: Path, pids: np.ndarray, labels: np.ndarray, probs: np.ndarr
 
 def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Dict[str, torch.Tensor]) -> dict:
     train_dataset = MultiEmbeddingDataset(
-        fold_data.train_pids, fold_data.train_matrix, EMBEDDING_DIR, protein_features_cache, chain=args.method
+        fold_data.train_pids, fold_data.train_matrix, EMBEDDING_DIR, protein_features_cache,
+        chain=args.method, pooling=args.pooling, use_crafted_features=args.use_crafted_features,
     )
     val_dataset = MultiEmbeddingDataset(
-        fold_data.val_pids, fold_data.val_matrix, EMBEDDING_DIR, protein_features_cache, chain=args.method
+        fold_data.val_pids, fold_data.val_matrix, EMBEDDING_DIR, protein_features_cache,
+        chain=args.method, pooling=args.pooling, use_crafted_features=args.use_crafted_features,
     )
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
@@ -178,7 +245,8 @@ def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Di
         val_dataset, batch_size=args.batch_size * 2, shuffle=False, num_workers=args.num_workers,
         collate_fn=collate_multi_embedding_batch, pin_memory=args.device.type == "cuda",
     )
-    model = MODEL_BUILDERS[args.method](args, num_classes=len(fold_data.classes)).to(args.device)
+    model_key = "esm2" if str(args.method).startswith("esm2-") else args.method
+    model = MODEL_BUILDERS[model_key](args, num_classes=len(fold_data.classes)).to(args.device)
     optimizer = torch.optim.AdamW(
         model.parameters(), 
         lr=args.lr, 
@@ -261,11 +329,13 @@ def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Di
         "aspect": args.aspect,
         "method": args.method,
     }
-    model_path = args.output_dir / f"{args.method}_{args.aspect}_{fold_data.fold_dir.name}.pt"
+    name = run_name(args, fold_data.fold_dir.name)
+    checkpoint["run_name"] = name
+    model_path = args.output_dir / f"{name}.pt"
     model_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, model_path)
     save_oof(
-        args.oof_dir / f"{args.method}_{args.aspect}_{fold_data.fold_dir.name}",
+        args.oof_dir / name,
         predictions["pids"], predictions["labels"], predictions["probs"], fold_data.classes, metrics,
     )
     return metrics
@@ -307,8 +377,8 @@ def run_training_job(config: Dict[str, object], obo_path: Path) -> dict:
         raise RuntimeError(f"Empty label space for aspect={args.aspect}, min_count={args.min_count}")
     if args.method != "blast":
         sequences = collect_unique_sequences_from_folds(args.fold)
-        ensure_embeddings(sequences, args.batch_size, args.device, args.method)
-        protein_features_cache = load_or_build_features(args.fold)
+        ensure_embeddings(sequences, args.batch_size, args.device, args.method, args.pooling)
+        protein_features_cache = load_or_build_features(args.fold) if args.use_crafted_features else {}
     else:
         protein_features_cache = {}
     metrics_by_fold = []
@@ -328,11 +398,13 @@ def main() -> None:
 
     cli_args = parse_args()
     if cli_args.method or cli_args.aspect:
-        base = resolve_matching_training_run(cli_args.method or "esm2_last", cli_args.aspect or "P", cli_args.cos_lr)
-        run_training_job(apply_cli_overrides(base, cli_args), cli_args.obo)
+        base = resolve_matching_training_run(
+            cli_args.method or f"esm2-{DEFAULT_ESM2_FINAL_LAYER}", cli_args.aspect or "P", cli_args.lr_scheduler
+        )
+        run_training_job(apply_cli_overrides(base, cli_args), DEFAULT_OBO_PATH)
         return
-    for config in get_training_runs(cli_args.cos_lr):
-        run_training_job(config, cli_args.obo)
+    for config in get_training_runs(cli_args.lr_scheduler):
+        run_training_job(config, DEFAULT_OBO_PATH)
 
 
 if __name__ == "__main__":

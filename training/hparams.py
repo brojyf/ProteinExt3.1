@@ -14,11 +14,13 @@ COMMON_TRAINING_CONFIG: Dict[str, object] = {
     "threshold": 0.5,
     "min_count": 20,
     "device": "auto",
+    "pooling": "both",
+    "use_crafted_features": True,
     "lr": 3e-4,
     "lr_factor": 0.5,
     "lr_patience": 2,
     "min_lr": 5e-5,
-    "lr_scheduler": "plateau",
+    "lr_scheduler": "cosine",
     "early_stop_patience": 6,
     "early_stop_min_delta": 1e-4,
     "weight_decay": 2e-4,
@@ -28,10 +30,6 @@ COMMON_TRAINING_CONFIG: Dict[str, object] = {
     "esm2_embedding_dim": 1280,
     "t5_embedding_dim": 1024,
     "blast_top_k": 30,
-}
-
-COSINE_TRAINING_CONFIG: Dict[str, object] = {
-    "lr_scheduler": "cosine",
 }
 
 TRAINING_RUNS: List[Dict[str, object]] = [
@@ -140,23 +138,23 @@ TRAINING_RUNS: List[Dict[str, object]] = [
 ]
 
 
-def resolve_training_run(run_config: Dict[str, object], use_cosine_lr: bool = False) -> Dict[str, object]:
+def resolve_training_run(run_config: Dict[str, object], lr_scheduler: str | None = None) -> Dict[str, object]:
     resolved = deepcopy(COMMON_TRAINING_CONFIG)
-    if use_cosine_lr:
-        resolved.update(deepcopy(COSINE_TRAINING_CONFIG))
+    if lr_scheduler is not None:
+        resolved["lr_scheduler"] = lr_scheduler
     resolved.update(deepcopy(run_config))
-    aliases = {"esm2": "esm2_last", "t5": "prott5"}
+    aliases = {"esm2": "esm2-33", "esm2_last": "esm2-33", "esm2_l20": "esm2-20", "t5": "prott5"}
     resolved["method"] = aliases.get(str(resolved["method"]), resolved["method"])
     return resolved
 
 
-def get_training_runs(use_cosine_lr: bool = False) -> List[Dict[str, object]]:
-    return [resolve_training_run(run, use_cosine_lr) for run in TRAINING_RUNS if bool(run.get("enabled", True))]
+def get_training_runs(lr_scheduler: str | None = None) -> List[Dict[str, object]]:
+    return [resolve_training_run(run, lr_scheduler) for run in TRAINING_RUNS if bool(run.get("enabled", True))]
 
 
-def resolve_matching_training_run(method: str, aspect: str, use_cosine_lr: bool = False) -> Dict[str, object]:
-    target = resolve_training_run({"method": method, "aspect": aspect}, use_cosine_lr)
-    for run in get_training_runs(use_cosine_lr):
+def resolve_matching_training_run(method: str, aspect: str, lr_scheduler: str | None = None) -> Dict[str, object]:
+    target = resolve_training_run({"method": method, "aspect": aspect}, lr_scheduler)
+    for run in get_training_runs(lr_scheduler):
         if run["method"] == target["method"] and run["aspect"] == target["aspect"]:
             return run
     return target

@@ -20,9 +20,9 @@ from training.data.go_utils import parse_go_obo, propagate_terms
 
 DEFAULT_RAW_DIR = ROOT_DIR / "training" / "data" / "raw"
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "training" / "data" / "cv"
-DEFAULT_FASTA = DEFAULT_RAW_DIR / "cafa.fasta"
-DEFAULT_LABELS = DEFAULT_RAW_DIR / "cafa.tsv"
-DEFAULT_OBO = DEFAULT_RAW_DIR / "go-basic.obo"
+DEFAULT_FASTA = DEFAULT_RAW_DIR / "training.fasta"
+DEFAULT_LABELS = DEFAULT_RAW_DIR / "training.tsv"
+DEFAULT_OBO = ROOT_DIR / "data" / "go-basic.obo"
 
 
 def parse_args() -> argparse.Namespace:

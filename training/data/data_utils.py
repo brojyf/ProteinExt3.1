@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -243,12 +244,17 @@ class MultiEmbeddingDataset(Dataset):
         embedding_dir: Path,
         protein_features_cache: Dict[str, torch.Tensor],
         chain: str = "all",
+        pooling: str = "both",
+        use_crafted_features: bool = True,
     ) -> None:
         self.pids = list(pids)
         self.labels = labels
         self.embedding_dir = Path(embedding_dir)
         self.protein_features_cache = protein_features_cache
         self.chain = chain
+        self.pooling = pooling
+        self.use_crafted_features = use_crafted_features
+        self._shard_cache: Dict[Path, Dict[str, torch.Tensor]] = {}
 
     def __len__(self) -> int:
         return len(self.pids)
@@ -262,15 +268,56 @@ class MultiEmbeddingDataset(Dataset):
             raise TypeError(f"Expected tensor embedding at {path}")
         return tensor.float()
 
+    def _load_pooled_embedding(self, pid: str, plm: str, layer: str) -> torch.Tensor:
+        pooling_names = ["mean", "max"] if self.pooling == "both" else [self.pooling]
+        tensors = []
+        for pooling_name in pooling_names:
+            layer_dir = self.embedding_dir / plm / pooling_name / layer
+            path = layer_dir / f"{pid}.pt"
+            if path.exists():
+                tensor = torch.load(path, map_location="cpu", weights_only=True)
+                if not isinstance(tensor, torch.Tensor):
+                    raise TypeError(f"Expected tensor embedding at {path}")
+            else:
+                tensor = self._load_sharded_pooled_embedding(pid, layer_dir)
+            tensors.append(tensor.float().flatten())
+        return torch.cat(tensors, dim=0) if len(tensors) > 1 else tensors[0]
+
+    def _load_sharded_pooled_embedding(self, pid: str, layer_dir: Path) -> torch.Tensor:
+        index_path = layer_dir / "index.json"
+        if not index_path.exists():
+            raise FileNotFoundError(f"Missing embedding for {pid}: {layer_dir / (pid + '.pt')} or {index_path}")
+        with index_path.open("r", encoding="utf-8") as handle:
+            index = json.load(handle)
+        shard_name = index.get(pid)
+        if shard_name is None:
+            raise FileNotFoundError(f"Missing embedding for {pid} in shard index: {index_path}")
+        shard_path = layer_dir / shard_name
+        shard = self._shard_cache.get(shard_path)
+        if shard is None:
+            loaded = torch.load(shard_path, map_location="cpu", weights_only=True)
+            if not isinstance(loaded, dict):
+                raise TypeError(f"Expected shard dict at {shard_path}")
+            shard = loaded
+            self._shard_cache[shard_path] = shard
+        tensor = shard.get(pid)
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"Expected tensor embedding for {pid} in {shard_path}")
+        return tensor
+
     def __getitem__(self, index: int):
         pid = self.pids[index]
-        item = {"pid": pid, "protein_features": self.protein_features_cache[pid].float()}
-        if self.chain == "esm2_last":
-            item["token_embeddings"] = self._load_embedding(pid, "esm2", "last")
+        item = {"pid": pid}
+        if self.use_crafted_features:
+            item["protein_features"] = self.protein_features_cache[pid].float()
+        if self.chain.startswith("esm2-"):
+            item["pooled_embeddings"] = self._load_pooled_embedding(pid, "esm2", self.chain.removeprefix("esm2-"))
+        elif self.chain == "esm2_last":
+            item["pooled_embeddings"] = self._load_pooled_embedding(pid, "esm2", "33")
         elif self.chain == "esm2_l20":
-            item["token_embeddings"] = self._load_embedding(pid, "esm2", "layer20")
+            item["pooled_embeddings"] = self._load_pooled_embedding(pid, "esm2", "20")
         elif self.chain == "prott5":
-            item["token_embeddings"] = self._load_embedding(pid, "t5", "last")
+            item["pooled_embeddings"] = self._load_pooled_embedding(pid, "t5", "0")
         elif self.chain == "all":
             item["esm2_layer20"] = self._load_embedding(pid, "esm2", "layer20")
             item["esm2_last"] = self._load_embedding(pid, "esm2", "last")
@@ -302,12 +349,15 @@ def collate_multi_embedding_batch(batch: Sequence[dict]):
         padded, mask = _pad_token_embeddings([item["token_embeddings"] for item in batch])
         inputs["token_embeddings"] = padded
         inputs["attention_mask"] = mask
+    elif "pooled_embeddings" in batch[0]:
+        inputs["pooled_embeddings"] = torch.stack([item["pooled_embeddings"] for item in batch], dim=0)
     else:
         for key in ("esm2_layer20", "esm2_last", "t5_last"):
             padded, mask = _pad_token_embeddings([item[key] for item in batch])
             inputs[key] = padded
             inputs[f"{key}_mask"] = mask
-    inputs["protein_features"] = torch.stack([item["protein_features"] for item in batch], dim=0)
+    if "protein_features" in batch[0]:
+        inputs["protein_features"] = torch.stack([item["protein_features"] for item in batch], dim=0)
     if "labels" not in batch[0]:
         return pids, inputs
     return pids, inputs, torch.stack([item["labels"] for item in batch], dim=0)
