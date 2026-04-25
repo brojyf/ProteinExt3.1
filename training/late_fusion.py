@@ -21,12 +21,12 @@ from tqdm.auto import tqdm
 from training.data.go_utils import build_propagation_indices, parse_go_obo, propagate_scores
 
 DEFAULT_OOF_DIR = ROOT_DIR / "training" / "oof"
-DEFAULT_OUTPUT = ROOT_DIR / "models" / "latefusion_new.csv"
+DEFAULT_OUTPUT = ROOT_DIR / "models_raw" / "latefusion_new.csv"
 DEFAULT_OBO_PATH = ROOT_DIR / "data" / "go-basic.obo"
-METHODS = ("esm2_last", "esm2_l20", "prott5", "blast")
+METHODS = ("esm2-33", "esm2-20", "prott5", "blast")
 METHOD_COLUMNS = {
-    "esm2_last": "last",
-    "esm2_l20": "l20",
+    "esm2-33": "last",
+    "esm2-20": "l20",
     "prott5": "t5",
     "blast": "blast",
 }
@@ -52,25 +52,24 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def artifact_prefix(oof_dir: Path, method: str, aspect: str, fold: int) -> Path:
-    return oof_dir / f"{method}_{aspect}_fold_{fold}"
+def oof_path(oof_dir: Path, method: str, aspect: str, fold: int) -> Path:
+    return oof_dir / method / f"{method}_{aspect}_fold_{fold}.npz"
+
+
+def _load_npz(oof_dir: Path, method: str, aspect: str, fold: int) -> np.lib.npyio.NpzFile:
+    path = oof_path(oof_dir, method, aspect, fold)
+    if not path.exists():
+        raise FileNotFoundError(f"Missing OOF artifact: {path}")
+    return np.load(path, allow_pickle=True)
 
 
 def load_array(oof_dir: Path, method: str, aspect: str, fold: int, kind: str, mmap_mode: str | None = None) -> np.ndarray:
-    prefix = artifact_prefix(oof_dir, method, aspect, fold)
-    path = prefix.with_name(prefix.name + f"_{kind}.npy")
-    if not path.exists():
-        raise FileNotFoundError(f"Missing OOF artifact: {path}")
-    return np.load(path, allow_pickle=True, mmap_mode=mmap_mode)
+    return _load_npz(oof_dir, method, aspect, fold)[kind]
 
 
 def load_metrics(oof_dir: Path, method: str, aspect: str, fold: int) -> dict:
-    prefix = artifact_prefix(oof_dir, method, aspect, fold)
-    path = prefix.with_name(prefix.name + "_metrics.json")
-    if not path.exists():
-        raise FileNotFoundError(f"Missing OOF metrics: {path}")
-    with path.open(encoding="utf-8") as handle:
-        return json.load(handle)
+    data = _load_npz(oof_dir, method, aspect, fold)
+    return json.loads(str(data["metrics_json"]))
 
 
 def validate_step(step: float) -> None:

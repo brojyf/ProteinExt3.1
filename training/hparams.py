@@ -5,7 +5,7 @@ from typing import Dict, List
 
 
 COMMON_TRAINING_CONFIG: Dict[str, object] = {
-    "method": "esm2_last",
+    "method": "esm2-33",
     "aspect": "P",
     "fold": [0, 1, 2, 3, 4],
     "epochs": 20,
@@ -34,7 +34,7 @@ COMMON_TRAINING_CONFIG: Dict[str, object] = {
 
 TRAINING_RUNS: List[Dict[str, object]] = [
     {
-        "method": "esm2_last",
+        "method": "esm2-33",
         "aspect": "P",
         "epochs": 24,
         "min_count": 30,
@@ -45,7 +45,7 @@ TRAINING_RUNS: List[Dict[str, object]] = [
         "dropout": 0.35,
     },
     {
-        "method": "esm2_last",
+        "method": "esm2-33",
         "aspect": "F",
         "epochs": 22,
         "min_count": 15,
@@ -56,7 +56,7 @@ TRAINING_RUNS: List[Dict[str, object]] = [
         "dropout": 0.3,
     },
     {
-        "method": "esm2_last",
+        "method": "esm2-33",
         "aspect": "C",
         "epochs": 18,
         "min_count": 10,
@@ -67,7 +67,7 @@ TRAINING_RUNS: List[Dict[str, object]] = [
         "dropout": 0.25,
     },
     {
-        "method": "esm2_l20",
+        "method": "esm2-20",
         "aspect": "P",
         "epochs": 22,
         "min_count": 30,
@@ -78,7 +78,7 @@ TRAINING_RUNS: List[Dict[str, object]] = [
         "dropout": 0.35,
     },
     {
-        "method": "esm2_l20",
+        "method": "esm2-20",
         "aspect": "F",
         "epochs": 20,
         "min_count": 15,
@@ -89,7 +89,7 @@ TRAINING_RUNS: List[Dict[str, object]] = [
         "dropout": 0.3,
     },
     {
-        "method": "esm2_l20",
+        "method": "esm2-20",
         "aspect": "C",
         "epochs": 18,
         "min_count": 10,
@@ -143,7 +143,7 @@ def resolve_training_run(run_config: Dict[str, object], lr_scheduler: str | None
     if lr_scheduler is not None:
         resolved["lr_scheduler"] = lr_scheduler
     resolved.update(deepcopy(run_config))
-    aliases = {"esm2": "esm2-33", "esm2_last": "esm2-33", "esm2_l20": "esm2-20", "t5": "prott5"}
+    aliases = {"esm2": "esm2-33"}
     resolved["method"] = aliases.get(str(resolved["method"]), resolved["method"])
     return resolved
 

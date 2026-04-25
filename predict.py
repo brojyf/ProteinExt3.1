@@ -17,7 +17,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from submethods import MODEL_BUILDERS
+from submethods import EMBEDDING_DIMS, build_model
 from submethods.bp_blast_transfer import _build_database, _parse_blast_hits, _require_blast, _run_blast, _transfer_scores
 from training.data.data_utils import (
     MultiEmbeddingDataset,
@@ -46,12 +46,6 @@ FUSION_COMPONENTS = {
     "esm2-33": "last",
     "esm2-20": "l20",
     "prott5": "t5",
-    "blast": "blast",
-}
-LEGACY_METHOD_KEYS = {
-    "esm2-33": "esm2_last",
-    "esm2-20": "esm2_l20",
-    "prott5": "prott5",
     "blast": "blast",
 }
 FUSION_NEURAL_METHODS = ("esm2-33", "esm2-20", "prott5")
@@ -88,7 +82,7 @@ def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device:
         for layer in esm2_layers
     }
     t5_indices = {
-        pooling_name: load_shard_index(PREDICT_EMBEDDING_DIR / "t5" / pooling_name / "0")
+        pooling_name: load_shard_index(PREDICT_EMBEDDING_DIR / "prott5" / pooling_name / "0")
         for pooling_name in pooling_names
     } if needs_t5 else {}
     missing_esm2 = [
@@ -102,7 +96,7 @@ def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device:
     missing_t5 = [
         pid for pid in sequences_by_pid
         if any(
-            not pooled_embedding_exists(PREDICT_EMBEDDING_DIR, "t5", pooling_name, 0, pid, t5_indices[pooling_name])
+            not pooled_embedding_exists(PREDICT_EMBEDDING_DIR, "prott5", pooling_name, 0, pid, t5_indices[pooling_name])
             for pooling_name in pooling_names
         )
     ] if needs_t5 else []
@@ -148,21 +142,16 @@ def esm2_method_layer(method: str) -> int | None:
     return int(layer)
 
 
-def model_builder_key(method: str) -> str:
-    if method == "esm2-20":
-        return "esm2_l20"
+def plm_key(method: str) -> str:
     if esm2_method_layer(method) is not None:
         return "esm2"
     return method
 
 
 def checkpoint_candidates(model_dir: Path, method: str, aspect: str) -> List[Path]:
-    legacy_method = LEGACY_METHOD_KEYS.get(method, method)
     final_patterns = [
         f"{method}_{aspect}_*_crafted_*.pt",
         f"{method}_{aspect}_*_no-crafted_*.pt",
-        f"{legacy_method}_{aspect}_*_crafted_*.pt",
-        f"{legacy_method}_{aspect}_*_no-crafted_*.pt",
     ]
     final_candidates: List[Path] = []
     for pattern in final_patterns:
@@ -176,27 +165,17 @@ def checkpoint_candidates(model_dir: Path, method: str, aspect: str) -> List[Pat
     fold_patterns = [
         f"{method}_{aspect}_*_crafted_*_fold_*.pt",
         f"{method}_{aspect}_*_no-crafted_*_fold_*.pt",
-        f"{method}_{aspect}_*_crafted_*_fold-*.pt",
-        f"{method}_{aspect}_*_no-crafted_*_fold-*.pt",
-        f"{legacy_method}_{aspect}_*_crafted_*_fold_*.pt",
-        f"{legacy_method}_{aspect}_*_no-crafted_*_fold_*.pt",
-        f"{legacy_method}_{aspect}_*_crafted_*_fold-*.pt",
-        f"{legacy_method}_{aspect}_*_no-crafted_*_fold-*.pt",
     ]
     candidates: List[Path] = []
     for pattern in fold_patterns:
         candidates.extend(sorted(model_dir.glob(pattern)))
-    legacy_path = model_dir / f"{legacy_method}_{aspect}.pt"
-    if legacy_path.exists():
-        candidates.append(legacy_path)
     return list(dict.fromkeys(candidates))
 
 
 def checkpoint_path(model_dir: Path, method: str, aspect: str) -> Path:
     candidates = checkpoint_candidates(model_dir, method, aspect)
     if not candidates:
-        legacy_method = LEGACY_METHOD_KEYS.get(method, method)
-        return model_dir / f"{legacy_method}_{aspect}.pt"
+        raise FileNotFoundError(f"No checkpoint found for method={method} aspect={aspect} in {model_dir}")
     if len(candidates) > 1:
         names = ", ".join(path.name for path in candidates)
         raise RuntimeError(f"Multiple checkpoints match method={method} aspect={aspect}: {names}")
@@ -241,7 +220,7 @@ def run_chain_inference(
         chain=method, pooling=model_args.pooling, use_crafted_features=model_args.use_crafted_features,
     )
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_multi_embedding_batch)
-    model = MODEL_BUILDERS[model_builder_key(method)](model_args, len(classes))
+    model = build_model(model_args, len(classes), embedding_dim=EMBEDDING_DIMS[plm_key(method)])
     model.load_state_dict(payload["model_state_dict"])
     model.to(device)
     result = predict_batches(model, loader, device, f"predict {path.stem}")

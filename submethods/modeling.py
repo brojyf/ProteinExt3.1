@@ -3,19 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-
-class MeanPooling(nn.Module):
-    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        mask = attention_mask.unsqueeze(-1).to(hidden_states.dtype)
-        return (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
-
-
-class MaxPooling(nn.Module):
-    def forward(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        mask = attention_mask.unsqueeze(-1).expand_as(hidden_states)
-        filled = torch.where(mask > 0, hidden_states, torch.full_like(hidden_states, float("-inf")))
-        pooled = filled.amax(dim=1)
-        return torch.where(torch.isfinite(pooled), pooled, torch.zeros_like(pooled))
+from training.data.data_utils import PROTEIN_FEATURE_DIM
 
 
 class FeatureEncoder(nn.Module):
@@ -66,3 +54,32 @@ class MLPHead(nn.Module):
         x = self.input_proj(self.input_norm(inputs))
         x = x + self.block(x)
         return self.output_head(x)
+
+
+class ChainMLPClassifier(nn.Module):
+    def __init__(
+        self,
+        num_classes: int,
+        embedding_dim: int,
+        protein_feature_dim: int = PROTEIN_FEATURE_DIM,
+        hidden_dim: int = 1024,
+        bottleneck: int = 1024,
+        dropout: float = 0.3,
+        pooling: str = "both",
+        use_crafted_features: bool = True,
+    ) -> None:
+        super().__init__()
+        self.pooling = pooling
+        self.use_crafted_features = use_crafted_features
+        self.feature_encoder = FeatureEncoder(protein_feature_dim, 256, dropout) if use_crafted_features else None
+        pooling_width = 2 if pooling == "both" else 1
+        feature_width = 256 if use_crafted_features else 0
+        input_dim = pooling_width * embedding_dim + feature_width
+        self.head = MLPHead(input_dim, num_classes, hidden_dim=hidden_dim, bottleneck=bottleneck, dropout=dropout)
+
+    def forward(self, batch_inputs: dict) -> torch.Tensor:
+        pooled = batch_inputs["pooled_embeddings"]
+        if self.feature_encoder is not None:
+            feature_repr = self.feature_encoder(batch_inputs["protein_features"].to(dtype=pooled.dtype))
+            pooled = torch.cat([pooled, feature_repr], dim=-1)
+        return self.head(pooled)

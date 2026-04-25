@@ -15,7 +15,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from submethods import MODEL_BUILDERS
+from submethods import EMBEDDING_DIMS, build_model
 from submethods.bp_blast_transfer import _build_database, _parse_blast_hits, _require_blast, _run_blast, _transfer_scores
 from training.data.data_utils import (
     EMBEDDING_DIR,
@@ -41,7 +41,7 @@ from training.data.embedding import (
 from training.data.go_utils import parse_go_obo
 from training.trainer import compute_multilabel_metrics, predict, train_one_epoch
 
-DEFAULT_OUTPUT_DIR = ROOT_DIR / "models"
+DEFAULT_OUTPUT_DIR = ROOT_DIR / "models_raw"
 DEFAULT_OOF_DIR = ROOT_DIR / "training" / "oof"
 DEFAULT_OBO_PATH = ROOT_DIR / "data" / "go-basic.obo"
 DEFAULT_ESM2_FINAL_LAYER = 33
@@ -50,9 +50,6 @@ DEFAULT_ESM2_FINAL_LAYER = 33
 def normalize_method(method: str) -> str:
     aliases = {
         "esm2": f"esm2-{DEFAULT_ESM2_FINAL_LAYER}",
-        "esm2_last": f"esm2-{DEFAULT_ESM2_FINAL_LAYER}",
-        "esm2_l20": "esm2-20",
-        "t5": "prott5",
     }
     normalized = aliases.get(method, method)
     if normalized.startswith("esm2-"):
@@ -171,7 +168,7 @@ def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device:
         for pooling_name in _pooling_names(pooling)
     } if esm2_layer is not None else None
     t5_indices = {
-        pooling_name: load_shard_index(EMBEDDING_DIR / "t5" / pooling_name / "0")
+        pooling_name: load_shard_index(EMBEDDING_DIR / "prott5" / pooling_name / "0")
         for pooling_name in _pooling_names(pooling)
     } if needs_t5 else None
     missing_esm2 = [
@@ -179,7 +176,7 @@ def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device:
         if esm2_layer is not None and not _embedding_exists(pid, "esm2", str(esm2_layer), pooling, esm2_indices)
     ]
     missing_t5 = [
-        pid for pid in sequences_by_pid if not _embedding_exists(pid, "t5", "0", pooling, t5_indices)
+        pid for pid in sequences_by_pid if not _embedding_exists(pid, "prott5", "0", pooling, t5_indices)
     ] if needs_t5 else []
     if missing_esm2:
         extract_esm2_embeddings(
@@ -220,12 +217,15 @@ def load_or_build_features(folds: Sequence[int]) -> Dict[str, torch.Tensor]:
 
 def save_oof(prefix: Path, pids: np.ndarray, labels: np.ndarray, probs: np.ndarray, classes: np.ndarray, metrics: dict) -> None:
     prefix.parent.mkdir(parents=True, exist_ok=True)
-    np.save(prefix.with_name(prefix.name + "_pids.npy"), pids)
-    np.save(prefix.with_name(prefix.name + "_labels.npy"), labels)
-    np.save(prefix.with_name(prefix.name + "_probs.npy"), probs)
-    np.save(prefix.with_name(prefix.name + "_classes.npy"), classes)
-    with prefix.with_name(prefix.name + "_metrics.json").open("w", encoding="utf-8") as handle:
-        json.dump(metrics, handle, indent=2, sort_keys=True)
+    path = prefix.with_suffix(".npz")
+    np.savez(
+        path,
+        pids=pids,
+        labels=labels,
+        probs=probs,
+        classes=classes,
+        metrics_json=np.array(json.dumps(metrics)),
+    )
 
 
 def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Dict[str, torch.Tensor]) -> dict:
@@ -245,8 +245,8 @@ def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Di
         val_dataset, batch_size=args.batch_size * 2, shuffle=False, num_workers=args.num_workers,
         collate_fn=collate_multi_embedding_batch, pin_memory=args.device.type == "cuda",
     )
-    model_key = "esm2" if str(args.method).startswith("esm2-") else args.method
-    model = MODEL_BUILDERS[model_key](args, num_classes=len(fold_data.classes)).to(args.device)
+    plm_key = "esm2" if args.method.startswith("esm2-") else args.method
+    model = build_model(args, num_classes=len(fold_data.classes), embedding_dim=EMBEDDING_DIMS[plm_key]).to(args.device)
     optimizer = torch.optim.AdamW(
         model.parameters(), 
         lr=args.lr, 
@@ -331,11 +331,12 @@ def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Di
     }
     name = run_name(args, fold_data.fold_dir.name)
     checkpoint["run_name"] = name
-    model_path = args.output_dir / f"{name}.pt"
+    model_path = args.output_dir / args.method / f"{name}.pt"
     model_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, model_path)
+    oof_prefix = f"{args.method}_{args.aspect}_{fold_data.fold_dir.name}"
     save_oof(
-        args.oof_dir / name,
+        args.oof_dir / args.method / oof_prefix,
         predictions["pids"], predictions["labels"], predictions["probs"], fold_data.classes, metrics,
     )
     return metrics
@@ -359,7 +360,7 @@ def run_blast_fold(args: SimpleNamespace, fold_data) -> dict:
     probs = _transfer_scores(pids, hits, fold_data.train_labels_df, fold_data.classes)
     labels = fold_data.val_matrix.toarray().astype(np.float32)
     metrics = compute_multilabel_metrics(labels, probs, args.threshold)
-    save_oof(args.oof_dir / f"blast_{args.aspect}_{fold_data.fold_dir.name}", pids, labels, probs, fold_data.classes, metrics)
+    save_oof(args.oof_dir / "blast" / f"blast_{args.aspect}_{fold_data.fold_dir.name}", pids, labels, probs, fold_data.classes, metrics)
     print(
         f"fold={fold_data.fold_dir.name} blast fmax={metrics['fmax']:.4f} "
         f"fmax_threshold={metrics['fmax_threshold']:.2f}"

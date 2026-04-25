@@ -449,18 +449,18 @@ def extract_t5_embeddings(
     if device.type == "mps":
         model = model.float()
     model.eval()
-    _validate_hidden_state_layers(resolved_layers, model.config.num_layers, "t5")
+    _validate_hidden_state_layers(resolved_layers, model.config.num_layers, "prott5")
     max_layer_index = resolved_layers[-1]
     shard_writer = ShardEmbeddingWriter(output_dir, shard_size)
 
     for pooling_name in pooling_names:
         for layer_index in resolved_layers:
-            (output_dir / "t5" / pooling_name / hidden_state_layer_dir(layer_index)).mkdir(
+            (output_dir / "prott5" / pooling_name / hidden_state_layer_dir(layer_index)).mkdir(
                 parents=True, exist_ok=True
             )
     shard_indices = {
         (pooling_name, layer_index): load_shard_index(
-            output_dir / "t5" / pooling_name / hidden_state_layer_dir(layer_index)
+            output_dir / "prott5" / pooling_name / hidden_state_layer_dir(layer_index)
         )
         for pooling_name in pooling_names
         for layer_index in resolved_layers
@@ -471,7 +471,7 @@ def extract_t5_embeddings(
         if any(
             not pooled_embedding_exists(
                 output_dir,
-                "t5",
+                "prott5",
                 pooling_name,
                 layer_index,
                 pid,
@@ -511,7 +511,7 @@ def extract_t5_embeddings(
             if 0 in resolved_layers:
                 save_pooled_batch(
                     output_dir=output_dir,
-                    plm="t5",
+                    plm="prott5",
                     layer_index=0,
                     pooling_names=pooling_names,
                     hidden_state=hidden_states,
@@ -545,7 +545,7 @@ def extract_t5_embeddings(
                 if layer_number in resolved_layers:
                     save_pooled_batch(
                         output_dir=output_dir,
-                        plm="t5",
+                        plm="prott5",
                         layer_index=layer_number,
                         pooling_names=pooling_names,
                         hidden_state=hidden_states,

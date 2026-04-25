@@ -1,11 +1,20 @@
-from submethods.esm2_final_mlp import build_model as build_esm2_model
-from submethods.esm2_layer20_mlp import build_model as build_esm2_l20_model
-from submethods.prott5_mlp import build_model as build_t5_model
+from submethods.modeling import ChainMLPClassifier
+from training.data.data_utils import PROTEIN_FEATURE_DIM
 
-MODEL_BUILDERS = {
-    "esm2_last": build_esm2_model,
-    "esm2_l20": build_esm2_l20_model,
-    "prott5": build_t5_model,
-    "esm2": build_esm2_model,
-    "t5": build_t5_model,
+EMBEDDING_DIMS = {
+    "esm2": 1280,
+    "prott5": 1024,
 }
+
+
+def build_model(args, num_classes: int, embedding_dim: int) -> ChainMLPClassifier:
+    return ChainMLPClassifier(
+        num_classes=num_classes,
+        embedding_dim=embedding_dim,
+        protein_feature_dim=getattr(args, "protein_feature_dim", PROTEIN_FEATURE_DIM),
+        hidden_dim=args.hidden_dim,
+        bottleneck=args.bottleneck,
+        dropout=args.dropout,
+        pooling=args.pooling,
+        use_crafted_features=args.use_crafted_features,
+    )

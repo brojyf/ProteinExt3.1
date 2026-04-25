@@ -6,7 +6,7 @@ __pycache__/
 Paper.pages
 
 # Models
-all_models/
+models_raw/
 models/*
 !models/fusion_weights.csv
 

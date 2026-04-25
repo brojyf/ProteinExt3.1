@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence
 
 import numpy as np
 import pandas as pd
@@ -259,15 +259,6 @@ class MultiEmbeddingDataset(Dataset):
     def __len__(self) -> int:
         return len(self.pids)
 
-    def _load_embedding(self, pid: str, plm: str, layer: str) -> torch.Tensor:
-        path = self.embedding_dir / plm / layer / f"{pid}.pt"
-        if not path.exists():
-            raise FileNotFoundError(f"Missing embedding for {pid}: {path}")
-        tensor = torch.load(path, map_location="cpu", weights_only=True)
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"Expected tensor embedding at {path}")
-        return tensor.float()
-
     def _load_pooled_embedding(self, pid: str, plm: str, layer: str) -> torch.Tensor:
         pooling_names = ["mean", "max"] if self.pooling == "both" else [self.pooling]
         tensors = []
@@ -312,16 +303,8 @@ class MultiEmbeddingDataset(Dataset):
             item["protein_features"] = self.protein_features_cache[pid].float()
         if self.chain.startswith("esm2-"):
             item["pooled_embeddings"] = self._load_pooled_embedding(pid, "esm2", self.chain.removeprefix("esm2-"))
-        elif self.chain == "esm2_last":
-            item["pooled_embeddings"] = self._load_pooled_embedding(pid, "esm2", "33")
-        elif self.chain == "esm2_l20":
-            item["pooled_embeddings"] = self._load_pooled_embedding(pid, "esm2", "20")
         elif self.chain == "prott5":
-            item["pooled_embeddings"] = self._load_pooled_embedding(pid, "t5", "0")
-        elif self.chain == "all":
-            item["esm2_layer20"] = self._load_embedding(pid, "esm2", "layer20")
-            item["esm2_last"] = self._load_embedding(pid, "esm2", "last")
-            item["t5_last"] = self._load_embedding(pid, "t5", "last")
+            item["pooled_embeddings"] = self._load_pooled_embedding(pid, "prott5", "0")
         else:
             raise ValueError(f"Unsupported embedding chain: {self.chain}")
         if self.labels is not None:
@@ -329,33 +312,10 @@ class MultiEmbeddingDataset(Dataset):
         return item
 
 
-def _pad_token_embeddings(tensors: Sequence[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-    batch_size = len(tensors)
-    max_length = max(tensor.size(0) for tensor in tensors)
-    dim = tensors[0].size(-1)
-    padded = torch.zeros((batch_size, max_length, dim), dtype=torch.float32)
-    mask = torch.zeros((batch_size, max_length), dtype=torch.long)
-    for index, tensor in enumerate(tensors):
-        length = tensor.size(0)
-        padded[index, :length] = tensor
-        mask[index, :length] = 1
-    return padded, mask
-
-
 def collate_multi_embedding_batch(batch: Sequence[dict]):
     pids = [item["pid"] for item in batch]
     inputs = {}
-    if "token_embeddings" in batch[0]:
-        padded, mask = _pad_token_embeddings([item["token_embeddings"] for item in batch])
-        inputs["token_embeddings"] = padded
-        inputs["attention_mask"] = mask
-    elif "pooled_embeddings" in batch[0]:
-        inputs["pooled_embeddings"] = torch.stack([item["pooled_embeddings"] for item in batch], dim=0)
-    else:
-        for key in ("esm2_layer20", "esm2_last", "t5_last"):
-            padded, mask = _pad_token_embeddings([item[key] for item in batch])
-            inputs[key] = padded
-            inputs[f"{key}_mask"] = mask
+    inputs["pooled_embeddings"] = torch.stack([item["pooled_embeddings"] for item in batch], dim=0)
     if "protein_features" in batch[0]:
         inputs["protein_features"] = torch.stack([item["protein_features"] for item in batch], dim=0)
     if "labels" not in batch[0]:
