@@ -51,8 +51,8 @@ Optional:
 python training/train.py --method esm2-33 --aspect P
 ```
 
-Required for one training run:
-- `--method`: `esm2-<layer>`, `prott5`, or `blast`; default training config: `esm2-33`
+Required for one neural CV training run:
+- `--method`: `esm2-<layer>` or `prott5`; default training config: `esm2-33`
 - `--aspect`: `P`, `F`, or `C`; default training config: `P`
 
 Optional:
@@ -62,10 +62,15 @@ Optional:
 - `--device`: `auto`, `cuda`, `mps`, or `cpu`; default `auto`
 - `--threads`: BLAST thread count; default `8`
 - `--pooling`: `both`, `mean`, or `max`; default `both`
-- `--model-dir`: checkpoint output directory; default `models`
+- `--model-dir`: checkpoint output directory; default `models_raw`
 - `--oof-dir`: OOF output directory; default `training/oof`
 - `--no-crafted`: disable handcrafted protein features; default crafted features enabled
 - `--lr-scheduler`: `cosine` or `plateau`; default `cosine`
+
+Exceptions:
+- BLAST does not accept `--aspect`; one run generates `P`, `F`, and `C` OOF files 
+- `--final`: train MLP methods on `training/data/raw/training.fasta` and `training/data/raw/training.tsv`; does not require `--fold` or `--oof-dir`, and does not save OOF
+
 
 ## Late Fusion
 ```bash

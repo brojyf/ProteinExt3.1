@@ -92,7 +92,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final", action="store_true", help="Train final model on raw training.fasta/training.tsv without OOF")
     parser.add_argument("--no-crafted", action="store_true", help="Disable handcrafted protein features")
     parser.add_argument("--lr-scheduler", choices=["cosine", "plateau"], default="cosine")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.method is not None and normalize_method(args.method) == "blast" and args.aspect is not None:
+        parser.error("--method blast does not accept --aspect; it always generates P/F/C OOF")
+    return args
 
 
 def is_mps_available() -> bool:
@@ -428,14 +431,15 @@ def run_blast_fold(args: SimpleNamespace, fold_data) -> dict:
     cache_dir = fold_data.fold_dir / "blast_cache"
     db_prefix = _build_database(fold_data.fold_dir / "train.fasta", cache_dir)
     output_path = cache_dir / "val_vs_train.tsv"
-    _run_blast(
-        fold_data.fold_dir / "val.fasta",
-        db_prefix,
-        output_path,
-        max_hits=args.blast_top_k,
-        evalue=1e-3,
-        num_threads=getattr(args, "blast_threads", 8),
-    )
+    if not output_path.exists():
+        _run_blast(
+            fold_data.fold_dir / "val.fasta",
+            db_prefix,
+            output_path,
+            max_hits=args.blast_top_k,
+            evalue=1e-3,
+            num_threads=getattr(args, "blast_threads", 8),
+        )
     hits = _parse_blast_hits(output_path)
     pids = np.asarray(fold_data.val_pids)
     probs = _transfer_scores(pids, hits, fold_data.train_labels_df, fold_data.classes)
@@ -489,10 +493,26 @@ def run_training_job(config: Dict[str, object], obo_path: Path) -> dict:
     return summary
 
 
+def run_blast_all_aspects(cli_args: argparse.Namespace, obo_path: Path) -> dict:
+    from training.hparams import resolve_matching_training_run
+
+    summaries = {}
+    for aspect in ("P", "F", "C"):
+        base = resolve_matching_training_run("blast", aspect, cli_args.lr_scheduler)
+        config = apply_cli_overrides(base, cli_args)
+        config["aspect"] = aspect
+        summaries[aspect] = run_training_job(config, obo_path)
+    return summaries
+
+
 def main() -> None:
     from training.hparams import get_training_runs, resolve_matching_training_run
 
     cli_args = parse_args()
+    cli_method = normalize_method(cli_args.method) if cli_args.method is not None else None
+    if cli_method == "blast":
+        run_blast_all_aspects(cli_args, DEFAULT_OBO_PATH)
+        return
     if cli_args.method or cli_args.aspect or cli_args.final:
         base = resolve_matching_training_run(
             cli_args.method or f"esm2-{DEFAULT_ESM2_FINAL_LAYER}", cli_args.aspect or "P", cli_args.lr_scheduler
