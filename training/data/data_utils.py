@@ -17,10 +17,13 @@ from training.data.go_utils import build_label_space, propagate_terms
 ROOT_DIR = Path(__file__).resolve().parents[2]
 TRAINING_DATA_DIR = ROOT_DIR / "training" / "data"
 FOLDS_DIR = TRAINING_DATA_DIR / "cv"
+RAW_DIR = TRAINING_DATA_DIR / "raw"
 EMBEDDING_DIR = TRAINING_DATA_DIR / "embedding"
 PROTEIN_FEATURES_DIR = TRAINING_DATA_DIR / "protein_features"
 LABEL_SPACE_DIR = TRAINING_DATA_DIR / "label_space"
 DEFAULT_OBO_PATH = TRAINING_DATA_DIR / "go-basic.obo"
+DEFAULT_RAW_FASTA = RAW_DIR / "training.fasta"
+DEFAULT_RAW_LABELS = RAW_DIR / "training.tsv"
 
 STANDARD_AMINO_ACIDS = tuple("ACDEFGHIKLMNPQRSTVWY")
 HYDRO_MAP = {
@@ -101,6 +104,10 @@ def collect_unique_sequences_from_folds(folds: Sequence[int]) -> Dict[str, str]:
     return sequences
 
 
+def collect_unique_sequences_from_raw(fasta_path: Path = DEFAULT_RAW_FASTA) -> Dict[str, str]:
+    return load_fasta_sequences(fasta_path)
+
+
 def load_labels(path: Path, aspect: str) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Label TSV not found: {path}")
@@ -133,6 +140,23 @@ def load_or_build_global_label_space(
         fold_dir = FOLDS_DIR / f"fold_{fold}"
         grouped_terms.extend(group_terms_by_pid(load_labels(fold_dir / "train_labels.tsv", aspect)).values())
         grouped_terms.extend(group_terms_by_pid(load_labels(fold_dir / "val_labels.tsv", aspect)).values())
+    classes = build_label_space(grouped_terms, parents, aspect=aspect, min_count=min_count)
+    np.save(path, classes)
+    return classes
+
+
+def load_or_build_raw_label_space(
+    *,
+    aspect: str,
+    parents: Dict[str, set[str]],
+    min_count: int,
+    labels_path: Path = DEFAULT_RAW_LABELS,
+) -> np.ndarray:
+    LABEL_SPACE_DIR.mkdir(parents=True, exist_ok=True)
+    path = LABEL_SPACE_DIR / f"{aspect}_min{min_count}.npy"
+    if path.exists():
+        return np.load(path, allow_pickle=True)
+    grouped_terms = list(group_terms_by_pid(load_labels(labels_path, aspect)).values())
     classes = build_label_space(grouped_terms, parents, aspect=aspect, min_count=min_count)
     np.save(path, classes)
     return classes
@@ -182,6 +206,26 @@ def load_fold_data(*, fold: int, aspect: str, parents: Dict[str, set[str]], clas
         val_matrix=encode_labels(val_pids, group_terms_by_pid(val_labels_df), classes, parents),
         train_labels_df=train_labels_df,
         val_labels_df=val_labels_df,
+    )
+
+
+def load_final_training_data(*, aspect: str, parents: Dict[str, set[str]], classes: np.ndarray) -> FoldData:
+    train_sequences = load_fasta_sequences(DEFAULT_RAW_FASTA)
+    train_labels_df = load_labels(DEFAULT_RAW_LABELS, aspect)
+    train_pids = sorted(train_sequences)
+    empty_labels_df = train_labels_df.iloc[0:0].copy()
+    return FoldData(
+        fold_dir=RAW_DIR,
+        aspect=aspect,
+        train_pids=train_pids,
+        val_pids=[],
+        train_sequences=train_sequences,
+        val_sequences={},
+        classes=classes,
+        train_matrix=encode_labels(train_pids, group_terms_by_pid(train_labels_df), classes, parents),
+        val_matrix=sparse.csr_matrix((0, len(classes)), dtype=np.float32),
+        train_labels_df=train_labels_df,
+        val_labels_df=empty_labels_df,
     )
 
 

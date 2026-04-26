@@ -23,10 +23,13 @@ from training.data.data_utils import (
     MultiEmbeddingDataset,
     build_and_save_protein_features,
     build_sequence_protein_features,
+    collect_unique_sequences_from_raw,
     collect_unique_sequences_from_folds,
     collate_multi_embedding_batch,
+    load_final_training_data,
     load_fold_data,
     load_or_build_global_label_space,
+    load_or_build_raw_label_space,
     load_protein_features_cache,
 )
 from training.data.embedding import (
@@ -86,6 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pooling", choices=["both", "mean", "max"], default=None)
     parser.add_argument("--model-dir", type=Path, default=None)
     parser.add_argument("--oof-dir", type=Path, default=None)
+    parser.add_argument("--final", action="store_true", help="Train final model on raw training.fasta/training.tsv without OOF")
     parser.add_argument("--no-crafted", action="store_true", help="Disable handcrafted protein features")
     parser.add_argument("--lr-scheduler", choices=["cosine", "plateau"], default="cosine")
     return parser.parse_args()
@@ -123,6 +127,8 @@ def apply_cli_overrides(config: Dict[str, object], args: argparse.Namespace) -> 
         resolved["output_dir"] = args.model_dir
     if args.oof_dir is not None:
         resolved["oof_dir"] = args.oof_dir
+    if args.final:
+        resolved["final"] = True
     if args.no_crafted:
         resolved["use_crafted_features"] = False
     if args.lr_scheduler is not None:
@@ -202,8 +208,11 @@ def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device:
 
 
 def load_or_build_features(folds: Sequence[int]) -> Dict[str, torch.Tensor]:
+    return load_or_build_features_for_sequences(collect_unique_sequences_from_folds(folds))
+
+
+def load_or_build_features_for_sequences(sequences: Dict[str, str]) -> Dict[str, torch.Tensor]:
     path = PROTEIN_FEATURES_DIR / "protein_features.pt"
-    sequences = collect_unique_sequences_from_folds(folds)
     if path.exists():
         cache = load_protein_features_cache(path)
         missing = {pid: seq for pid, seq in sequences.items() if pid not in cache}
@@ -342,6 +351,78 @@ def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Di
     return metrics
 
 
+def run_neural_final(args: SimpleNamespace, final_data, protein_features_cache: Dict[str, torch.Tensor]) -> dict:
+    train_dataset = MultiEmbeddingDataset(
+        final_data.train_pids, final_data.train_matrix, EMBEDDING_DIR, protein_features_cache,
+        chain=args.method, pooling=args.pooling, use_crafted_features=args.use_crafted_features,
+    )
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
+        collate_fn=collate_multi_embedding_batch, pin_memory=args.device.type == "cuda",
+    )
+    plm_key = "esm2" if args.method.startswith("esm2-") else args.method
+    model = build_model(args, num_classes=len(final_data.classes), embedding_dim=EMBEDDING_DIMS[plm_key]).to(args.device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        fused=(args.device.type == "cuda"),
+    )
+    use_amp = args.device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    if args.lr_scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+            eta_min=args.min_lr,
+        )
+    elif args.lr_scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=args.lr_factor,
+            patience=args.lr_patience,
+            min_lr=args.min_lr,
+        )
+    else:
+        raise ValueError(f"Unsupported lr_scheduler={args.lr_scheduler}")
+    print(f"final lr_scheduler={args.lr_scheduler}")
+    final_state = None
+    final_loss = 0.0
+    for epoch in range(1, args.epochs + 1):
+        epoch_lr = float(optimizer.param_groups[0]["lr"])
+        result = train_one_epoch(
+            model, train_loader, optimizer, args.device, f"final epoch {epoch}",
+            scaler=scaler, use_amp=use_amp,
+        )
+        final_loss = float(result.loss)
+        print(f"final epoch={epoch} lr={epoch_lr:.2e} loss={final_loss:.4f}")
+        final_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+        if args.lr_scheduler == "cosine":
+            scheduler.step()
+        else:
+            scheduler.step(final_loss)
+    if final_state is None:
+        raise RuntimeError("No checkpoint was produced; check epochs")
+    metrics = {"train_loss": final_loss, "epochs": int(args.epochs)}
+    checkpoint = {
+        "model_state_dict": final_state,
+        "classes": final_data.classes,
+        "args": vars(args).copy() | {"device": str(args.device), "output_dir": str(args.output_dir), "oof_dir": str(args.oof_dir)},
+        "metrics": metrics,
+        "best_epoch": int(args.epochs),
+        "best_metrics": metrics,
+        "aspect": args.aspect,
+        "method": args.method,
+    }
+    name = run_name(args, "final")
+    checkpoint["run_name"] = name
+    model_path = args.output_dir / args.method / f"{name}.pt"
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(checkpoint, model_path)
+    return metrics
+
+
 def run_blast_fold(args: SimpleNamespace, fold_data) -> dict:
     _require_blast()
     cache_dir = fold_data.fold_dir / "blast_cache"
@@ -371,11 +452,25 @@ def run_blast_fold(args: SimpleNamespace, fold_data) -> dict:
 def run_training_job(config: Dict[str, object], obo_path: Path) -> dict:
     args = namespace_from_config(config)
     parents = parse_go_obo(obo_path)
-    classes = load_or_build_global_label_space(
-        folds=args.fold, aspect=args.aspect, parents=parents, min_count=int(args.min_count)
-    )
+    if bool(getattr(args, "final", False)):
+        if args.method == "blast":
+            raise ValueError("--final is only supported for neural methods; BLAST does not produce a model checkpoint")
+        classes = load_or_build_raw_label_space(
+            aspect=args.aspect, parents=parents, min_count=int(args.min_count)
+        )
+    else:
+        classes = load_or_build_global_label_space(
+            folds=args.fold, aspect=args.aspect, parents=parents, min_count=int(args.min_count)
+        )
     if len(classes) == 0:
         raise RuntimeError(f"Empty label space for aspect={args.aspect}, min_count={args.min_count}")
+    if bool(getattr(args, "final", False)):
+        sequences = collect_unique_sequences_from_raw()
+        ensure_embeddings(sequences, args.batch_size, args.device, args.method, args.pooling)
+        protein_features_cache = load_or_build_features_for_sequences(sequences) if args.use_crafted_features else {}
+        metrics = run_neural_final(args, load_final_training_data(aspect=args.aspect, parents=parents, classes=classes), protein_features_cache)
+        print(json.dumps(metrics, indent=2, sort_keys=True))
+        return metrics
     if args.method != "blast":
         sequences = collect_unique_sequences_from_folds(args.fold)
         ensure_embeddings(sequences, args.batch_size, args.device, args.method, args.pooling)
@@ -398,7 +493,7 @@ def main() -> None:
     from training.hparams import get_training_runs, resolve_matching_training_run
 
     cli_args = parse_args()
-    if cli_args.method or cli_args.aspect:
+    if cli_args.method or cli_args.aspect or cli_args.final:
         base = resolve_matching_training_run(
             cli_args.method or f"esm2-{DEFAULT_ESM2_FINAL_LAYER}", cli_args.aspect or "P", cli_args.lr_scheduler
         )
