@@ -49,6 +49,9 @@ Optional:
 ## Training
 ```bash
 python training/train.py --method esm2-33 --aspect P
+
+# BLAST doesn't use --aspect
+python training/train.py --method blast
 ```
 
 Required for one neural CV training run:
@@ -66,9 +69,6 @@ Optional:
 - `--oof-dir`: OOF output directory; default `training/oof`
 - `--no-crafted`: disable handcrafted protein features; default crafted features enabled
 - `--lr-scheduler`: `cosine` or `plateau`; default `cosine`
-
-Exceptions:
-- BLAST does not accept `--aspect`; one run generates `P`, `F`, and `C` OOF files 
 - `--final`: train MLP methods on `training/data/raw/training.fasta` and `training/data/raw/training.tsv`; does not require `--fold` or `--oof-dir`, and does not save OOF
 
 
