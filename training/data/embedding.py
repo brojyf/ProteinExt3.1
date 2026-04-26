@@ -507,6 +507,7 @@ def extract_t5_embeddings(
                 attention_mask=attention_mask,
             )
             position_bias = None
+            cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device)
 
             if 0 in resolved_layers:
                 save_pooled_batch(
@@ -535,7 +536,7 @@ def extract_t5_embeddings(
                     use_cache=False,
                     output_attentions=False,
                     return_dict=True,
-                    cache_position=None,
+                    cache_position=cache_position,
                 )
                 hidden_states = layer_outputs[0]
                 position_bias = layer_outputs[1]

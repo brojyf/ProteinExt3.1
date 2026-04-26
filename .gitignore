@@ -9,7 +9,6 @@ Paper.pages
 models/*
 !models/fusion_weights.csv
 
-
 # Prediction Data
 data/*
 !data/README.md
@@ -29,4 +28,3 @@ training/data/go-basic.obo
 # TEMP
 comparison/
 exploration/
-esm233_*/
