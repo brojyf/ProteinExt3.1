@@ -2,16 +2,19 @@
 
 ```text
 training/
-├── README.md
 ├── *.py
 ├── data/
 │   ├── *.py
 │   ├── go-basic.obo
+│   ├── ic.pkl
 │   ├── raw/
 │   │   ├── training.fasta
 │   │   └── training.tsv
+│   ├── propagated/
+│   │   ├── training.fasta
+│   │   └── training.tsv
 │   ├── cv/
-│   │   └── fold_0-4/
+│   │   └── fold_<0-4>/
 │   │       ├── train.fasta
 │   │       ├── train_labels.tsv
 │   │       ├── val.fasta
@@ -19,11 +22,12 @@ training/
 │   ├── embedding/
 │   │   └── <plm>/<pooling>/<layer>/
 │   │       ├── index.json
-│   │       ├── shard_00000.pt
-│   │       └── shard_00001.pt
+│   │       └── shard_<id>.pt
 │   ├── label_space/
 │   │   └── <aspect>_min<min_count>.npy
 │   └── protein_features/
 │       └── protein_features.pt
 └── oof/
+    └── <method>/
+        └── <method>_<aspect>_fold_<id>.npz
 ```

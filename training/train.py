@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import pickle
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -47,7 +48,9 @@ from training.trainer import compute_multilabel_metrics, predict, train_one_epoc
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "models_raw"
 DEFAULT_OOF_DIR = ROOT_DIR / "training" / "oof"
 DEFAULT_OBO_PATH = ROOT_DIR / "training" / "data" / "go-basic.obo"
+DEFAULT_IC_PATH = ROOT_DIR / "training" / "data" / "ic.pkl"
 DEFAULT_ESM2_FINAL_LAYER = 33
+DEFAULT_PROTT5_LAYER = 24
 
 
 def normalize_method(method: str) -> str:
@@ -89,7 +92,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pooling", choices=["both", "mean", "max"], default=None)
     parser.add_argument("--model-dir", type=Path, default=None)
     parser.add_argument("--oof-dir", type=Path, default=None)
-    parser.add_argument("--final", action="store_true", help="Train final model on raw training.fasta/training.tsv without OOF")
+    parser.add_argument("--obo", type=Path, default=DEFAULT_OBO_PATH)
+    parser.add_argument("--ic-pkl", type=Path, default=DEFAULT_IC_PATH)
+    parser.add_argument("--final", action="store_true", help="Train final model on propagated training.fasta/training.tsv without OOF")
     parser.add_argument("--no-crafted", action="store_true", help="Disable handcrafted protein features")
     parser.add_argument("--lr-scheduler", choices=["cosine", "plateau"], default="cosine")
     args = parser.parse_args()
@@ -130,6 +135,8 @@ def apply_cli_overrides(config: Dict[str, object], args: argparse.Namespace) -> 
         resolved["output_dir"] = args.model_dir
     if args.oof_dir is not None:
         resolved["oof_dir"] = args.oof_dir
+    if args.ic_pkl is not None:
+        resolved["ic_pkl"] = args.ic_pkl
     if args.final:
         resolved["final"] = True
     if args.no_crafted:
@@ -145,7 +152,23 @@ def namespace_from_config(config: Dict[str, object]) -> SimpleNamespace:
     args.device = resolve_device(str(args.device))
     args.output_dir = Path(getattr(args, "output_dir", DEFAULT_OUTPUT_DIR))
     args.oof_dir = Path(getattr(args, "oof_dir", DEFAULT_OOF_DIR))
+    args.ic_pkl = Path(getattr(args, "ic_pkl", DEFAULT_IC_PATH))
     return args
+
+
+def load_information_content(ic_path: Path, aspect: str, classes: np.ndarray) -> np.ndarray:
+    if not ic_path.exists():
+        raise FileNotFoundError(f"IC pickle not found: {ic_path}")
+    with ic_path.open("rb") as handle:
+        payload = pickle.load(handle)
+    ic_by_aspect = payload[-1] if isinstance(payload, tuple) else payload
+    if aspect not in ic_by_aspect:
+        raise ValueError(f"IC pickle missing aspect={aspect}: {ic_path}")
+    aspect_ic = ic_by_aspect[aspect]
+    missing = [str(term) for term in classes if str(term) not in aspect_ic]
+    if missing:
+        print(f"warning: IC pickle missing {len(missing)} {aspect} terms; using IC=0 for missing terms")
+    return np.asarray([float(aspect_ic.get(str(term), 0.0)) for term in classes], dtype=np.float64)
 
 
 def _pooling_names(pooling: str) -> list[str]:
@@ -177,7 +200,7 @@ def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device:
         for pooling_name in _pooling_names(pooling)
     } if esm2_layer is not None else None
     t5_indices = {
-        pooling_name: load_shard_index(EMBEDDING_DIR / "prott5" / pooling_name / "0")
+        pooling_name: load_shard_index(EMBEDDING_DIR / "prott5" / pooling_name / str(DEFAULT_PROTT5_LAYER))
         for pooling_name in _pooling_names(pooling)
     } if needs_t5 else None
     missing_esm2 = [
@@ -185,7 +208,7 @@ def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device:
         if esm2_layer is not None and not _embedding_exists(pid, "esm2", str(esm2_layer), pooling, esm2_indices)
     ]
     missing_t5 = [
-        pid for pid in sequences_by_pid if not _embedding_exists(pid, "prott5", "0", pooling, t5_indices)
+        pid for pid in sequences_by_pid if not _embedding_exists(pid, "prott5", str(DEFAULT_PROTT5_LAYER), pooling, t5_indices)
     ] if needs_t5 else []
     if missing_esm2:
         extract_esm2_embeddings(
@@ -207,6 +230,7 @@ def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device:
             max_length=DEFAULT_MAX_LENGTH,
             device=device,
             pooling=pooling,
+            layer_indices=[DEFAULT_PROTT5_LAYER],
         )
 
 
@@ -241,6 +265,7 @@ def save_oof(prefix: Path, pids: np.ndarray, labels: np.ndarray, probs: np.ndarr
 
 
 def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Dict[str, torch.Tensor]) -> dict:
+    information_content = load_information_content(args.ic_pkl, args.aspect, fold_data.classes)
     train_dataset = MultiEmbeddingDataset(
         fold_data.train_pids, fold_data.train_matrix, EMBEDDING_DIR, protein_features_cache,
         chain=args.method, pooling=args.pooling, use_crafted_features=args.use_crafted_features,
@@ -328,7 +353,9 @@ def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Di
         raise RuntimeError("No checkpoint was produced; check epochs")
     model.load_state_dict(best_state)
     predictions = predict(model, val_loader, args.device, "final validation", use_amp=use_amp)
-    metrics = compute_multilabel_metrics(predictions["labels"], predictions["probs"], args.threshold)
+    metrics = compute_multilabel_metrics(
+        predictions["labels"], predictions["probs"], args.threshold, information_content=information_content
+    )
     metrics = dict(metrics)
     metrics["best_epoch"] = best_epoch
     checkpoint = {
@@ -444,7 +471,8 @@ def run_blast_fold(args: SimpleNamespace, fold_data) -> dict:
     pids = np.asarray(fold_data.val_pids)
     probs = _transfer_scores(pids, hits, fold_data.train_labels_df, fold_data.classes)
     labels = fold_data.val_matrix.toarray().astype(np.float32)
-    metrics = compute_multilabel_metrics(labels, probs, args.threshold)
+    information_content = load_information_content(args.ic_pkl, args.aspect, fold_data.classes)
+    metrics = compute_multilabel_metrics(labels, probs, args.threshold, information_content=information_content)
     save_oof(args.oof_dir / "blast" / f"blast_{args.aspect}_{fold_data.fold_dir.name}", pids, labels, probs, fold_data.classes, metrics)
     print(
         f"fold={fold_data.fold_dir.name} blast fmax={metrics['fmax']:.4f} "
@@ -488,7 +516,11 @@ def run_training_job(config: Dict[str, object], obo_path: Path) -> dict:
             metrics_by_fold.append(run_blast_fold(args, fold_data))
         else:
             metrics_by_fold.append(run_neural_fold(args, fold_data, protein_features_cache))
-    summary = {"avg_fmax": float(np.mean([item["fmax"] for item in metrics_by_fold]))}
+    summary = {
+        "avg_fmax": float(np.mean([item["fmax"] for item in metrics_by_fold])),
+        "avg_smin": float(np.mean([item["smin"] for item in metrics_by_fold])),
+        "avg_aupr": float(np.mean([item["aupr"] for item in metrics_by_fold])),
+    }
     print(json.dumps(summary, indent=2, sort_keys=True))
     return summary
 
@@ -511,16 +543,16 @@ def main() -> None:
     cli_args = parse_args()
     cli_method = normalize_method(cli_args.method) if cli_args.method is not None else None
     if cli_method == "blast":
-        run_blast_all_aspects(cli_args, DEFAULT_OBO_PATH)
+        run_blast_all_aspects(cli_args, cli_args.obo)
         return
     if cli_args.method or cli_args.aspect or cli_args.final:
         base = resolve_matching_training_run(
             cli_args.method or f"esm2-{DEFAULT_ESM2_FINAL_LAYER}", cli_args.aspect or "P", cli_args.lr_scheduler
         )
-        run_training_job(apply_cli_overrides(base, cli_args), DEFAULT_OBO_PATH)
+        run_training_job(apply_cli_overrides(base, cli_args), cli_args.obo)
         return
     for config in get_training_runs(cli_args.lr_scheduler):
-        run_training_job(config, DEFAULT_OBO_PATH)
+        run_training_job(apply_cli_overrides(config, cli_args), cli_args.obo)
 
 
 if __name__ == "__main__":

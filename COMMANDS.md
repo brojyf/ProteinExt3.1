@@ -1,23 +1,50 @@
 # Commands
 Check the [training/README.md](training/README.md) and [data/README.md](data/README.md) for more detailed directory information.
-1. [Make CV](#make-cv)
-2. [Embedding](#embedding)
-3. [Training](#training)
-4. [Late Fusion](#late-fusion)
-5. [Inference](#inference)
-6. [Comparison](#comparison)
-7. [Exploration](#exploration)
+1. [Propagate Labels](#propagate-labels)
+2. [Information Content](#information-content)
+3. [Make CV](#make-cv)
+4. [Embedding](#embedding)
+5. [Training](#training)
+6. [Late Fusion](#late-fusion)
+7. [Inference](#inference)
+8. [Comparison](#comparison)
+9. [Exploration](#exploration)
 
+
+## Propagate Labels
+```bash
+python training/data/propagate.py
+```
+
+Optional:
+- `--fasta`: input FASTA path; default `training/data/raw/training.fasta`
+- `--labels`: input labels TSV path; default `training/data/raw/training.tsv`
+- `--obo`: GO OBO path; default `training/data/go-basic.obo`
+- `--out-dir`: propagated output directory; default `training/data/propagated`
+
+## Information Content
+```bash
+python training/data/ic.py
+```
+
+Run [Propagate Labels](#propagate-labels) before this command. `ic.py` reads `training/data/propagated/` by default.
+
+Optional:
+- `--obo`: GO OBO path; default `training/data/go-basic.obo`
+- `--fasta`: training FASTA path; default `training/data/propagated/training.fasta`
+- `--labels`: training labels TSV path; default `training/data/propagated/training.tsv`
+- `--out`: output pickle path; default `training/data/ic.pkl`
 
 ## Make CV
 ```bash
 python training/data/make_cv.py
 ```
 
+Run [Propagate Labels](#propagate-labels) before this command. `make_cv.py` reads `training/data/propagated/` by default.
+
 Optional:
-- `--fasta`: input FASTA path; default `training/data/raw/training.fasta`
-- `--labels`: input labels TSV path; default `training/data/raw/training.tsv`
-- `--obo`: GO OBO path; default `data/go-basic.obo`
+- `--fasta`: input FASTA path; default `training/data/propagated/training.fasta`
+- `--labels`: input labels TSV path; default `training/data/propagated/training.tsv`
 - `--out`: CV output directory; default `training/data/cv`
 - `--folds`: number of folds; default `5`
 - `--seed`: random seed; default `42`
@@ -52,6 +79,9 @@ python training/train.py --method esm2-33 --aspect P
 
 # BLAST doesn't use --aspect
 python training/train.py --method blast
+
+# Final model training uses propagated labels by default
+python training/train.py --method esm2-33 --aspect P --final
 ```
 
 Required for one neural CV training run:
@@ -67,10 +97,11 @@ Optional:
 - `--pooling`: `both`, `mean`, or `max`; default `both`
 - `--model-dir`: checkpoint output directory; default `models_raw`
 - `--oof-dir`: OOF output directory; default `training/oof`
+- `--obo`: GO OBO path; default `training/data/go-basic.obo`
+- `--ic-pkl`: IC pickle path for OOF Smin metrics; default `training/data/ic.pkl`
 - `--no-crafted`: disable handcrafted protein features; default crafted features enabled
 - `--lr-scheduler`: `cosine` or `plateau`; default `cosine`
-- `--final`: train MLP methods on `training/data/raw/training.fasta` and `training/data/raw/training.tsv`; does not require `--fold` or `--oof-dir`, and does not save OOF
-
+- `--final`: train MLP methods on `training/data/propagated/training.fasta` and `training/data/propagated/training.tsv`; does not require `--fold` or `--oof-dir`, and does not save OOF
 
 ## Late Fusion
 ```bash

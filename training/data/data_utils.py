@@ -18,12 +18,16 @@ ROOT_DIR = Path(__file__).resolve().parents[2]
 TRAINING_DATA_DIR = ROOT_DIR / "training" / "data"
 FOLDS_DIR = TRAINING_DATA_DIR / "cv"
 RAW_DIR = TRAINING_DATA_DIR / "raw"
+PROPAGATED_DIR = TRAINING_DATA_DIR / "propagated"
 EMBEDDING_DIR = TRAINING_DATA_DIR / "embedding"
 PROTEIN_FEATURES_DIR = TRAINING_DATA_DIR / "protein_features"
 LABEL_SPACE_DIR = TRAINING_DATA_DIR / "label_space"
 DEFAULT_OBO_PATH = TRAINING_DATA_DIR / "go-basic.obo"
 DEFAULT_RAW_FASTA = RAW_DIR / "training.fasta"
 DEFAULT_RAW_LABELS = RAW_DIR / "training.tsv"
+DEFAULT_PROPAGATED_FASTA = PROPAGATED_DIR / "training.fasta"
+DEFAULT_PROPAGATED_LABELS = PROPAGATED_DIR / "training.tsv"
+DEFAULT_PROTT5_LAYER = "24"
 
 STANDARD_AMINO_ACIDS = tuple("ACDEFGHIKLMNPQRSTVWY")
 HYDRO_MAP = {
@@ -104,7 +108,7 @@ def collect_unique_sequences_from_folds(folds: Sequence[int]) -> Dict[str, str]:
     return sequences
 
 
-def collect_unique_sequences_from_raw(fasta_path: Path = DEFAULT_RAW_FASTA) -> Dict[str, str]:
+def collect_unique_sequences_from_raw(fasta_path: Path = DEFAULT_PROPAGATED_FASTA) -> Dict[str, str]:
     return load_fasta_sequences(fasta_path)
 
 
@@ -150,7 +154,7 @@ def load_or_build_raw_label_space(
     aspect: str,
     parents: Dict[str, set[str]],
     min_count: int,
-    labels_path: Path = DEFAULT_RAW_LABELS,
+    labels_path: Path = DEFAULT_PROPAGATED_LABELS,
 ) -> np.ndarray:
     LABEL_SPACE_DIR.mkdir(parents=True, exist_ok=True)
     path = LABEL_SPACE_DIR / f"{aspect}_min{min_count}.npy"
@@ -210,12 +214,12 @@ def load_fold_data(*, fold: int, aspect: str, parents: Dict[str, set[str]], clas
 
 
 def load_final_training_data(*, aspect: str, parents: Dict[str, set[str]], classes: np.ndarray) -> FoldData:
-    train_sequences = load_fasta_sequences(DEFAULT_RAW_FASTA)
-    train_labels_df = load_labels(DEFAULT_RAW_LABELS, aspect)
+    train_sequences = load_fasta_sequences(DEFAULT_PROPAGATED_FASTA)
+    train_labels_df = load_labels(DEFAULT_PROPAGATED_LABELS, aspect)
     train_pids = sorted(train_sequences)
     empty_labels_df = train_labels_df.iloc[0:0].copy()
     return FoldData(
-        fold_dir=RAW_DIR,
+        fold_dir=PROPAGATED_DIR,
         aspect=aspect,
         train_pids=train_pids,
         val_pids=[],
@@ -352,7 +356,7 @@ class MultiEmbeddingDataset(Dataset):
         if self.chain.startswith("esm2-"):
             item["pooled_embeddings"] = self._load_pooled_embedding(pid, "esm2", self.chain.removeprefix("esm2-"))
         elif self.chain == "prott5":
-            item["pooled_embeddings"] = self._load_pooled_embedding(pid, "prott5", "0")
+            item["pooled_embeddings"] = self._load_pooled_embedding(pid, "prott5", DEFAULT_PROTT5_LAYER)
         else:
             raise ValueError(f"Unsupported embedding chain: {self.chain}")
         if self.labels is not None:

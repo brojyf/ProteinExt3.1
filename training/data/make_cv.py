@@ -16,20 +16,17 @@ if str(ROOT_DIR) not in sys.path:
 import pandas as pd
 
 from training.data.data_utils import load_fasta_sequences
-from training.data.go_utils import parse_go_obo, propagate_terms
 
-DEFAULT_RAW_DIR = ROOT_DIR / "training" / "data" / "raw"
+DEFAULT_PROPAGATED_DIR = ROOT_DIR / "training" / "data" / "propagated"
 DEFAULT_OUTPUT_DIR = ROOT_DIR / "training" / "data" / "cv"
-DEFAULT_FASTA = DEFAULT_RAW_DIR / "training.fasta"
-DEFAULT_LABELS = DEFAULT_RAW_DIR / "training.tsv"
-DEFAULT_OBO = ROOT_DIR / "data" / "go-basic.obo"
+DEFAULT_FASTA = DEFAULT_PROPAGATED_DIR / "training.fasta"
+DEFAULT_LABELS = DEFAULT_PROPAGATED_DIR / "training.tsv"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build fold_* CV files from raw FASTA and labels TSV")
+    parser = argparse.ArgumentParser(description="Build fold_* CV files from propagated FASTA and labels TSV")
     parser.add_argument("--fasta", type=Path, default=DEFAULT_FASTA)
     parser.add_argument("--labels", type=Path, default=DEFAULT_LABELS)
-    parser.add_argument("--obo", type=Path, default=DEFAULT_OBO)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
@@ -117,17 +114,6 @@ def run_cd_hit(args: argparse.Namespace, work_dir: Path) -> List[List[str]]:
     return load_cd_hit_clusters(output_prefix.with_suffix(output_prefix.suffix + ".clstr"))
 
 
-def propagate_labels(labels: pd.DataFrame, obo_path: Path) -> pd.DataFrame:
-    if not obo_path.exists():
-        raise FileNotFoundError(f"GO OBO file not found: {obo_path}")
-    parents = parse_go_obo(obo_path)
-    rows: List[Dict[str, str]] = []
-    for (pid, aspect), group in labels.groupby(["EntryID", "aspect"], sort=False):
-        for term in sorted(propagate_terms(group["term"], parents)):
-            rows.append({"EntryID": pid, "term": term, "aspect": aspect})
-    return pd.DataFrame(rows, columns=["EntryID", "term", "aspect"])
-
-
 def write_fasta(path: Path, pids: Sequence[str], sequences: Dict[str, str]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for pid in pids:
@@ -201,7 +187,7 @@ def prepare_output_dir(path: Path, overwrite: bool) -> None:
 
 def make_cv(args: argparse.Namespace) -> None:
     sequences = load_fasta_sequences(args.fasta)
-    labels = propagate_labels(load_labels(args.labels), args.obo)
+    labels = load_labels(args.labels)
     validate_inputs(sequences, labels, args.folds)
     prepare_output_dir(args.out, args.overwrite)
 

@@ -84,12 +84,25 @@ def predict(
     }
 
 
-def compute_multilabel_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float = 0.5) -> Dict[str, float]:
+def compute_multilabel_metrics(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    threshold: float = 0.5,
+    information_content: np.ndarray | None = None,
+) -> Dict[str, float]:
     if y_true.size == 0 or y_prob.size == 0:
-        return {"micro_f1": 0.0, "micro_precision": 0.0, "micro_recall": 0.0, "fmax": 0.0, "fmax_threshold": threshold}
+        metrics = {"micro_f1": 0.0, "micro_precision": 0.0, "micro_recall": 0.0, "fmax": 0.0, "fmax_threshold": threshold}
+        if information_content is not None:
+            metrics.update({"smin": 0.0, "aupr": 0.0})
+        return metrics
     y_true_bool = y_true.astype(bool)
     best_fmax = 0.0
     best_threshold = threshold
+    precision_points = []
+    recall_points = []
+    best_smin = float("inf")
+    true_by_term = y_true_bool.sum(axis=0)
+    total_positive = int(true_by_term.sum())
     for candidate in np.linspace(0.01, 0.99, 99):
         pred = y_prob >= candidate
         true_per = y_true_bool.sum(axis=1)
@@ -103,14 +116,29 @@ def compute_multilabel_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold
         if f1 > best_fmax:
             best_fmax = f1
             best_threshold = float(candidate)
+        if information_content is not None:
+            tp = np.logical_and(pred, y_true_bool).sum(axis=0)
+            predicted_by_term = pred.sum(axis=0)
+            ru = float(((true_by_term - tp) * information_content).sum() / y_true_bool.shape[0])
+            mi = float(((predicted_by_term - tp) * information_content).sum() / y_true_bool.shape[0])
+            best_smin = min(best_smin, float(np.hypot(ru, mi)))
+            predicted_total = int(predicted_by_term.sum())
+            precision_points.append(float(tp.sum() / predicted_total) if predicted_total > 0 else 1.0)
+            recall_points.append(float(tp.sum() / total_positive) if total_positive > 0 else 0.0)
     pred = y_prob >= threshold
     tp = int(np.logical_and(pred, y_true_bool).sum())
     pred_pos = int(pred.sum())
     true_pos = int(y_true_bool.sum())
-    return {
+    metrics = {
         "micro_f1": float((2 * tp) / (pred_pos + true_pos)) if pred_pos + true_pos > 0 else 0.0,
         "micro_precision": float(tp / pred_pos) if pred_pos > 0 else 0.0,
         "micro_recall": float(tp / true_pos) if true_pos > 0 else 0.0,
         "fmax": best_fmax,
         "fmax_threshold": best_threshold,
     }
+    if information_content is not None:
+        recall_curve = np.asarray([0.0, *reversed(recall_points), 1.0], dtype=np.float64)
+        precision_curve = np.asarray([1.0, *reversed(precision_points), precision_points[0]], dtype=np.float64)
+        metrics["smin"] = best_smin
+        metrics["aupr"] = float(np.trapz(precision_curve, recall_curve))
+    return metrics

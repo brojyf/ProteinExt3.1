@@ -23,7 +23,9 @@ training/data/embedding/
 training/data/label_space/
 training/data/protein_features/
 training/data/raw/
+training/data/propagated/
 training/data/go-basic.obo
+training/data/ic.pkl
 
 # TEMP
 comparison/
