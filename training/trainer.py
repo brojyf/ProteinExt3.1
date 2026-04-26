@@ -140,5 +140,5 @@ def compute_multilabel_metrics(
         recall_curve = np.asarray([0.0, *reversed(recall_points), 1.0], dtype=np.float64)
         precision_curve = np.asarray([1.0, *reversed(precision_points), precision_points[0]], dtype=np.float64)
         metrics["smin"] = best_smin
-        metrics["aupr"] = float(np.trapz(precision_curve, recall_curve))
+        metrics["aupr"] = float(np.sum(np.diff(recall_curve) * (precision_curve[:-1] + precision_curve[1:]) / 2.0))
     return metrics
