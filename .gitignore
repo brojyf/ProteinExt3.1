@@ -7,6 +7,7 @@ Paper.pages
 
 # Models
 models/*
+models_raw/*
 !models/fusion_weights.csv
 
 # Prediction Data

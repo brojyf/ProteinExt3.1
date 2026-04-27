@@ -373,9 +373,8 @@ def run_neural_fold(args: SimpleNamespace, fold_data, protein_features_cache: Di
     model_path = args.output_dir / args.method / f"{name}.pt"
     model_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(checkpoint, model_path)
-    oof_prefix = f"{args.method}_{args.aspect}_{fold_data.fold_dir.name}"
     save_oof(
-        args.oof_dir / args.method / oof_prefix,
+        args.oof_dir / args.method / name,
         predictions["pids"], predictions["labels"], predictions["probs"], fold_data.classes, metrics,
     )
     return metrics
