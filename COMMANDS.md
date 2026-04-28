@@ -108,15 +108,13 @@ Optional:
 python training/late_fusion.py
 ```
 
+For each aspect, all methods that have OOF artifacts present for every fold under `training/oof/` are auto-discovered and fused. Folds (`0 1 2 3 4`), OOF directory (`training/oof/`) and OBO path (`data/go-basic.obo`) are fixed internally.
+
 Optional:
 - `--aspect`: one or more GO aspects; choices `P`, `F`, `C`; default `P F C`
-- `--fold`: one or more fold ids; default `0 1 2 3 4`
-- `--oof-dir`: OOF prediction directory; default `training/oof`
-- `--output`: output fusion weights CSV path; default `models_raw/latefusion_new.csv`
-- `--obo`: GO OBO path; default `data/go-basic.obo`
 - `--step`: simplex grid search step size (must divide 1.0); default `0.1`
 - `--device`: `auto`, `cuda`, `mps`, or `cpu`; default `auto`
-- `--jobs`: parallel aspect jobs; `0` uses one job per requested aspect; default `0`
+- `--out`: output fusion weights CSV path (a `*_summary.json` is written alongside); default `models_raw/latefusion_new.csv`
 
 ## Inference
 ```bash
