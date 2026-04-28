@@ -33,27 +33,32 @@ COMMON_TRAINING_CONFIG: Dict[str, object] = {
 }
 
 TRAINING_RUNS: List[Dict[str, object]] = [
+    # --- ESM2 V2 tuned ---
     {
-        "method": "esm2-33",
+        "method": "esm2-28",
         "aspect": "P",
         "epochs": 24,
         "min_count": 30,
-        "lr": 2e-4,
-        "weight_decay": 3e-4,
-        "hidden_dim": 2048,
-        "bottleneck": 1024,
-        "dropout": 0.35,
-    },
-    {
-        "method": "esm2-33",
-        "aspect": "F",
-        "epochs": 22,
-        "min_count": 15,
         "lr": 3e-4,
         "weight_decay": 2e-4,
         "hidden_dim": 2048,
         "bottleneck": 1024,
         "dropout": 0.3,
+        "pooling": "mean",
+        "use_crafted_features": False,
+    },
+    {
+        "method": "esm2-28",
+        "aspect": "F",
+        "epochs": 24,
+        "min_count": 20,
+        "lr": 3e-4,
+        "weight_decay": 2e-4,
+        "hidden_dim": 2048,
+        "bottleneck": 1024,
+        "dropout": 0.3,
+        "pooling": "mean",
+        "use_crafted_features": False,
     },
     {
         "method": "esm2-33",
@@ -65,39 +70,8 @@ TRAINING_RUNS: List[Dict[str, object]] = [
         "hidden_dim": 1536,
         "bottleneck": 768,
         "dropout": 0.25,
-    },
-    {
-        "method": "esm2-20",
-        "aspect": "P",
-        "epochs": 22,
-        "min_count": 30,
-        "lr": 3e-4,
-        "weight_decay": 3e-4,
-        "hidden_dim": 1536,
-        "bottleneck": 768,
-        "dropout": 0.35,
-    },
-    {
-        "method": "esm2-20",
-        "aspect": "F",
-        "epochs": 20,
-        "min_count": 15,
-        "lr": 3e-4,
-        "weight_decay": 2e-4,
-        "hidden_dim": 1536,
-        "bottleneck": 768,
-        "dropout": 0.3,
-    },
-    {
-        "method": "esm2-20",
-        "aspect": "C",
-        "epochs": 18,
-        "min_count": 10,
-        "lr": 3e-4,
-        "weight_decay": 2e-4,
-        "hidden_dim": 1024,
-        "bottleneck": 512,
-        "dropout": 0.25,
+        "pooling": "mean",
+        "use_crafted_features": True,
     },
     {
         "method": "prott5",
@@ -158,3 +132,4 @@ def resolve_matching_training_run(method: str, aspect: str, lr_scheduler: str | 
         if run["method"] == target["method"] and run["aspect"] == target["aspect"]:
             return run
     return target
+

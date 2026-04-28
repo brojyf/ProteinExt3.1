@@ -7,7 +7,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 import json
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Sequence
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -23,7 +23,7 @@ from training.data.go_utils import build_propagation_indices, parse_go_obo, prop
 DEFAULT_OOF_DIR = ROOT_DIR / "training" / "oof"
 DEFAULT_OUTPUT = ROOT_DIR / "models_raw" / "latefusion_new.csv"
 DEFAULT_OBO_PATH = ROOT_DIR / "data" / "go-basic.obo"
-METHODS = ("esm2-33", "esm2-20", "prott5", "blast")
+DEFAULT_METHODS = ("esm2-33", "esm2-20", "prott5", "blast")
 METHOD_COLUMNS = {
     "esm2-33": "last",
     "esm2-20": "l20",
@@ -56,10 +56,56 @@ def oof_path(oof_dir: Path, method: str, aspect: str, fold: int) -> Path:
     return oof_dir / method / f"{method}_{aspect}_fold_{fold}.npz"
 
 
+def method_column(method: str) -> str:
+    return METHOD_COLUMNS.get(method, method.replace("-", "_"))
+
+
+def parse_oof_method(path: Path, aspect: str) -> str | None:
+    marker = f"_{aspect}_"
+    if marker not in path.stem:
+        return None
+    return path.stem.split(marker, 1)[0]
+
+
+def find_oof_path(oof_dir: Path, method: str, aspect: str, fold: int) -> Path:
+    exact = oof_path(oof_dir, method, aspect, fold)
+    if exact.exists():
+        return exact
+    pattern = f"**/{method}_{aspect}_*fold_{fold}.npz"
+    matches = sorted(path for path in oof_dir.glob(pattern) if parse_oof_method(path, aspect) == method)
+    if not matches:
+        raise FileNotFoundError(f"Missing OOF artifact for method={method} aspect={aspect} fold={fold} under {oof_dir}")
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Multiple OOF artifacts for method={method} aspect={aspect} fold={fold}: "
+            + ", ".join(str(path) for path in matches)
+        )
+    return matches[0]
+
+
+def discover_methods(oof_dir: Path, aspect: str, folds: Sequence[int]) -> List[str]:
+    methods_by_fold = []
+    for fold in folds:
+        methods = {
+            method
+            for path in oof_dir.glob(f"**/*_{aspect}_*fold_{fold}.npz")
+            for method in [parse_oof_method(path, aspect)]
+            if method is not None
+        }
+        methods_by_fold.append(methods)
+    if not methods_by_fold:
+        raise RuntimeError(f"No OOF artifacts found for aspect={aspect} under {oof_dir}")
+    available = set.intersection(*methods_by_fold)
+    preferred = [method for method in DEFAULT_METHODS if method in available]
+    extras = sorted(available - set(preferred))
+    methods = preferred + extras
+    if not methods:
+        raise RuntimeError(f"No OOF method has all requested folds for aspect={aspect}: {folds}")
+    return methods
+
+
 def _load_npz(oof_dir: Path, method: str, aspect: str, fold: int) -> np.lib.npyio.NpzFile:
-    path = oof_path(oof_dir, method, aspect, fold)
-    if not path.exists():
-        raise FileNotFoundError(f"Missing OOF artifact: {path}")
+    path = find_oof_path(oof_dir, method, aspect, fold)
     return np.load(path, allow_pickle=True)
 
 
@@ -138,33 +184,90 @@ def best_fold(oof_dir: Path, method: str, aspect: str, folds: List[int]) -> int:
     return best[1]
 
 
-def load_aspect_references(oof_dir: Path, aspect: str, folds: List[int], parents: dict) -> List[dict]:
-    references = []
-    classes = None
-    prop_indices = None
+def build_union_classes(oof_dir: Path, methods: Sequence[str], aspect: str, folds: Sequence[int]) -> np.ndarray:
+    terms: set[str] = set()
     for fold in folds:
-        reference_pids = load_array(oof_dir, METHODS[0], aspect, fold, "pids")
-        reference_classes = load_array(oof_dir, METHODS[0], aspect, fold, "classes")
-        labels = load_array(oof_dir, METHODS[0], aspect, fold, "labels", mmap_mode="r").astype(np.float32, copy=False)
-        if classes is None:
-            classes = reference_classes
-            prop_indices = build_propagation_indices(classes, parents)
-        elif not np.array_equal(classes, reference_classes):
-            raise ValueError(f"Class mismatch on aspect={aspect} fold={fold}")
-        for method in METHODS[1:]:
-            pids = load_array(oof_dir, method, aspect, fold, "pids")
-            method_classes = load_array(oof_dir, method, aspect, fold, "classes")
-            if not np.array_equal(reference_pids, pids):
-                raise ValueError(f"PID mismatch on method={method} aspect={aspect} fold={fold}")
-            if not np.array_equal(reference_classes, method_classes):
-                raise ValueError(f"Class mismatch on method={method} aspect={aspect} fold={fold}")
+        for method in methods:
+            terms.update(str(term) for term in load_array(oof_dir, method, aspect, fold, "classes"))
+    return np.asarray(sorted(terms), dtype=object)
+
+
+def align_matrix_to_classes(matrix: np.ndarray, source_classes: np.ndarray, target_classes: np.ndarray) -> np.ndarray:
+    if np.array_equal(source_classes, target_classes):
+        return matrix.astype(np.float32, copy=False)
+    source_index = {str(term): index for index, term in enumerate(source_classes)}
+    cols = [source_index.get(str(term)) for term in target_classes]
+    aligned = np.zeros((matrix.shape[0], len(target_classes)), dtype=np.float32)
+    target_cols = [index for index, source_col in enumerate(cols) if source_col is not None]
+    source_cols = [source_col for source_col in cols if source_col is not None]
+    if source_cols:
+        aligned[:, target_cols] = matrix[:, source_cols]
+    return aligned
+
+
+def align_matrix(
+    matrix: np.ndarray,
+    source_pids: np.ndarray,
+    source_classes: np.ndarray,
+    target_pids: np.ndarray,
+    target_classes: np.ndarray,
+) -> np.ndarray:
+    class_aligned = align_matrix_to_classes(matrix, source_classes, target_classes)
+    if np.array_equal(source_pids, target_pids):
+        return class_aligned
+    pid_to_index = {str(pid): index for index, pid in enumerate(source_pids)}
+    rows = [pid_to_index.get(str(pid)) for pid in target_pids]
+    aligned = np.zeros((len(target_pids), class_aligned.shape[1]), dtype=np.float32)
+    target_rows = [index for index, source_row in enumerate(rows) if source_row is not None]
+    source_rows = [source_row for source_row in rows if source_row is not None]
+    if source_rows:
+        aligned[target_rows] = class_aligned[source_rows]
+    return aligned
+
+
+def common_fold_pids(oof_dir: Path, methods: Sequence[str], aspect: str, fold: int) -> np.ndarray:
+    pid_sets = [
+        set(str(pid) for pid in load_array(oof_dir, method, aspect, fold, "pids"))
+        for method in methods
+    ]
+    common = set.intersection(*pid_sets)
+    if not common:
+        raise ValueError(f"No common PIDs for aspect={aspect} fold={fold} methods={list(methods)}")
+    first_pids = load_array(oof_dir, methods[0], aspect, fold, "pids")
+    ordered = [str(pid) for pid in first_pids if str(pid) in common]
+    if len(common) != len(first_pids) or any(len(common) != len(pid_set) for pid_set in pid_sets[1:]):
+        print(
+            f"aspect={aspect} fold={fold}: using {len(common)} common PIDs "
+            f"across methods={list(methods)}"
+        )
+    return np.asarray(ordered, dtype=object)
+
+
+def load_aspect_references(
+    oof_dir: Path,
+    methods: Sequence[str],
+    aspect: str,
+    folds: List[int],
+    parents: dict,
+) -> List[dict]:
+    references = []
+    classes = build_union_classes(oof_dir, methods, aspect, folds)
+    prop_indices = build_propagation_indices(classes, parents)
+    for fold in folds:
+        reference_pids = common_fold_pids(oof_dir, methods, aspect, fold)
+        source_pids = load_array(oof_dir, methods[0], aspect, fold, "pids")
+        reference_classes = load_array(oof_dir, methods[0], aspect, fold, "classes")
+        raw_labels = load_array(oof_dir, methods[0], aspect, fold, "labels", mmap_mode="r").astype(np.float32, copy=False)
+        labels = align_matrix(raw_labels, source_pids, reference_classes, reference_pids, classes)
         propagated_labels = propagate_scores(labels, prop_indices).astype(bool, copy=False)
         true_per = propagated_labels.sum(axis=1)
         references.append(
             {
                 "aspect": aspect,
                 "fold": fold,
+                "pids": reference_pids,
                 "shape": labels.shape,
+                "classes": classes,
                 "prop_indices": prop_indices,
                 "labels": propagated_labels,
                 "true_per": true_per,
@@ -174,9 +277,9 @@ def load_aspect_references(oof_dir: Path, aspect: str, folds: List[int], parents
     return references
 
 
-def build_weight_matrix(candidates: List[Dict[str, float]]) -> np.ndarray:
+def build_weight_matrix(candidates: List[Dict[str, float]], methods: Sequence[str]) -> np.ndarray:
     return np.array(
-        [[weights.get(method, 0.0) for method in METHODS] for weights in candidates],
+        [[weights.get(method, 0.0) for method in methods] for weights in candidates],
         dtype=np.float32,
     )
 
@@ -333,10 +436,23 @@ def finalize_metric_accumulator(accumulator: dict, candidate_index: int) -> Dict
     }
 
 
-def load_fold_probs(oof_dir: Path, aspect: str, fold: int) -> Dict[str, np.ndarray]:
+def load_fold_probs(
+    oof_dir: Path,
+    methods: Sequence[str],
+    aspect: str,
+    fold: int,
+    pids: np.ndarray,
+    classes: np.ndarray,
+) -> Dict[str, np.ndarray]:
     return {
-        method: load_array(oof_dir, method, aspect, fold, "probs", mmap_mode="r")
-        for method in METHODS
+        method: align_matrix(
+            load_array(oof_dir, method, aspect, fold, "probs", mmap_mode="r"),
+            load_array(oof_dir, method, aspect, fold, "pids"),
+            load_array(oof_dir, method, aspect, fold, "classes"),
+            pids,
+            classes,
+        )
+        for method in methods
     }
 
 
@@ -367,10 +483,10 @@ def cpu_batch_size(n_candidates: int, shape: tuple[int, int]) -> int:
     return max(1, min(n_candidates, CPU_BATCH_BYTES // max(score_matrix_bytes(shape), 1)))
 
 
-def cuda_batch_size(n_candidates: int, shape: tuple[int, int]) -> int:
+def cuda_batch_size(n_candidates: int, shape: tuple[int, int], n_methods: int) -> int:
     bytes_per = score_matrix_bytes(shape)
     free_bytes, _ = torch.cuda.mem_get_info()
-    budget = int(free_bytes * CUDA_WORKING_BYTES_FRACTION) - len(METHODS) * bytes_per
+    budget = int(free_bytes * CUDA_WORKING_BYTES_FRACTION) - n_methods * bytes_per
     if budget < bytes_per:
         return 0
     return max(1, min(n_candidates, budget // max(bytes_per, 1)))
@@ -380,13 +496,13 @@ def mps_batch_size(n_candidates: int, shape: tuple[int, int]) -> int:
     return max(1, min(n_candidates, MPS_BATCH_BYTES // max(score_matrix_bytes(shape), 1)))
 
 
-def select_fusion_backend(reference: dict, n_candidates: int, requested_device: str) -> dict:
+def select_fusion_backend(reference: dict, n_candidates: int, n_methods: int, requested_device: str) -> dict:
     shape = reference["shape"]
     bytes_per = score_matrix_bytes(shape)
     n_cls = shape[1]
     cpu_batch = cpu_batch_size(n_candidates, shape)
     mps_batch = mps_batch_size(n_candidates, shape)
-    mps_fits = (len(METHODS) + 1) * bytes_per <= MPS_BATCH_BYTES
+    mps_fits = (n_methods + 1) * bytes_per <= MPS_BATCH_BYTES
 
     if requested_device == "cpu":
         return {"kind": "numpy", "device": torch.device("cpu"), "batch": cpu_batch, "metric_bytes": CPU_BATCH_BYTES}
@@ -394,7 +510,7 @@ def select_fusion_backend(reference: dict, n_candidates: int, requested_device: 
     if requested_device == "cuda":
         if not torch.cuda.is_available():
             raise RuntimeError("Requested cuda, but CUDA is not available")
-        cuda_batch = cuda_batch_size(n_candidates, shape)
+        cuda_batch = cuda_batch_size(n_candidates, shape, n_methods)
         if cuda_batch <= 0:
             raise RuntimeError("Requested cuda, but the estimated free GPU memory is not enough for one fusion batch")
         free_bytes, _ = torch.cuda.mem_get_info()
@@ -416,7 +532,7 @@ def select_fusion_backend(reference: dict, n_candidates: int, requested_device: 
         raise ValueError(f"Unsupported device={requested_device}")
 
     if torch.cuda.is_available():
-        cuda_batch = cuda_batch_size(n_candidates, shape)
+        cuda_batch = cuda_batch_size(n_candidates, shape, n_methods)
         if cuda_batch > 0 and n_cls <= CUDA_PROPAGATION_CLASS_LIMIT:
             free_bytes, _ = torch.cuda.mem_get_info()
             return {
@@ -461,9 +577,9 @@ def propagate_scores_torch(scores: torch.Tensor, descendant_indices: List[torch.
     return propagated
 
 
-def fuse_candidate_scores_numpy(weight_batch: np.ndarray, fold_probs: Dict[str, np.ndarray]) -> np.ndarray:
+def fuse_candidate_scores_numpy(weight_batch: np.ndarray, fold_probs: Dict[str, np.ndarray], methods: Sequence[str]) -> np.ndarray:
     fused_batch = None
-    for method_index, method in enumerate(METHODS):
+    for method_index, method in enumerate(methods):
         probs = np.asarray(fold_probs[method], dtype=np.float32)
         contribution = weight_batch[:, method_index].reshape(-1, 1, 1) * probs[None, :, :]
         if fused_batch is None:
@@ -478,10 +594,11 @@ def fuse_candidate_scores_numpy(weight_batch: np.ndarray, fold_probs: Dict[str, 
 def fuse_candidate_scores_torch(
     weight_batch: torch.Tensor,
     fold_probs: Dict[str, np.ndarray],
+    methods: Sequence[str],
     device: torch.device,
 ) -> torch.Tensor:
     fused_batch = None
-    for method_index, method in enumerate(METHODS):
+    for method_index, method in enumerate(methods):
         # fold_probs may be a read-only mmap array; materialize a writable copy before torch conversion.
         probs = torch.from_numpy(np.array(fold_probs[method], dtype=np.float32, copy=True)).to(device)
         contribution = probs.unsqueeze(0) * weight_batch[:, method_index].view(-1, 1, 1)
@@ -498,6 +615,7 @@ def fuse_candidate_scores_torch(
 def update_candidates_for_fold(
     reference: dict,
     fold_probs: Dict[str, np.ndarray],
+    methods: Sequence[str],
     accumulators: dict,
     backend: dict,
     *,
@@ -518,7 +636,7 @@ def update_candidates_for_fold(
 
         for c0 in range(0, n_cand, batch):
             c1 = min(c0 + batch, n_cand)
-            fused_batch = fuse_candidate_scores_torch(backend["weight_matrix"][c0:c1], fold_probs, backend["device"])
+            fused_batch = fuse_candidate_scores_torch(backend["weight_matrix"][c0:c1], fold_probs, methods, backend["device"])
             propagated_batch = propagate_scores_torch(fused_batch, torch_prop_indices)
             batch_metrics = compute_metric_batch_torch(
                 labels_torch,
@@ -538,7 +656,7 @@ def update_candidates_for_fold(
 
     for c0 in range(0, n_cand, batch):
         c1 = min(c0 + batch, n_cand)
-        fused_batch = fuse_candidate_scores_numpy(backend["weight_matrix"][c0:c1], fold_probs)
+        fused_batch = fuse_candidate_scores_numpy(backend["weight_matrix"][c0:c1], fold_probs, methods)
         propagated_batch = propagate_scores_numpy_batch(fused_batch, prop_indices)
         batch_metrics = compute_metric_batch_numpy(labels, true_per, has_label, propagated_batch)
         merge_metric_batch(accumulators, c0, batch_metrics)
@@ -580,6 +698,7 @@ def neighborhood_union(centers: List[Dict[str, float]], methods: List[str], step
 def _eval_grid(
     references: List[dict],
     oof_dir: Path,
+    methods: Sequence[str],
     aspect: str,
     candidates: List[Dict[str, float]],
     *,
@@ -588,8 +707,8 @@ def _eval_grid(
     requested_device: str,
 ) -> dict:
     accumulators = empty_metric_accumulator(len(candidates))
-    backend = select_fusion_backend(references[0], len(candidates), requested_device)
-    weight_matrix = build_weight_matrix(candidates)
+    backend = select_fusion_backend(references[0], len(candidates), len(methods), requested_device)
+    weight_matrix = build_weight_matrix(candidates, methods)
     if backend["kind"] == "torch":
         backend["weight_matrix"] = torch.from_numpy(weight_matrix).to(backend["device"])
         threshold_dtype = torch.float32 if backend["device"].type == "mps" else torch.float64
@@ -605,8 +724,8 @@ def _eval_grid(
     progress = tqdm(total=len(candidates) * len(references), desc=desc, dynamic_ncols=True, position=position)
     try:
         for ref in references:
-            fold_probs = load_fold_probs(oof_dir, aspect, ref["fold"])
-            update_candidates_for_fold(ref, fold_probs, accumulators, backend, progress=progress)
+            fold_probs = load_fold_probs(oof_dir, methods, aspect, ref["fold"], ref["pids"], references[0]["classes"])
+            update_candidates_for_fold(ref, fold_probs, methods, accumulators, backend, progress=progress)
             del fold_probs
     finally:
         progress.close()
@@ -615,6 +734,7 @@ def _eval_grid(
 
 def search_aspect(
     oof_dir: Path,
+    methods: Sequence[str],
     aspect: str,
     folds: List[int],
     step: float,
@@ -623,7 +743,7 @@ def search_aspect(
     position: int = 0,
     requested_device: str = "auto",
 ) -> dict:
-    references = load_aspect_references(oof_dir, aspect, folds, parents)
+    references = load_aspect_references(oof_dir, methods, aspect, folds, parents)
 
     coarse_step = step * 2
     try:
@@ -634,22 +754,22 @@ def search_aspect(
 
     if use_two_stage:
         # Stage 1: coarse grid
-        coarse_cands = simplex_grid(METHODS, coarse_step)
+        coarse_cands = simplex_grid(methods, coarse_step)
         coarse_accs = _eval_grid(
-            references, oof_dir, aspect, coarse_cands, desc=f"{aspect} coarse", position=position, requested_device=requested_device
+            references, oof_dir, methods, aspect, coarse_cands, desc=f"{aspect} coarse", position=position, requested_device=requested_device
         )
 
         # Stage 2: refine around top 2
         tops = top_candidates(coarse_cands, coarse_accs, k=2)
-        fine_cands = neighborhood_union(tops, list(METHODS), step, radius=coarse_step)
+        fine_cands = neighborhood_union(tops, list(methods), step, radius=coarse_step)
         fine_accs = _eval_grid(
-            references, oof_dir, aspect, fine_cands, desc=f"{aspect} refine", position=position, requested_device=requested_device
+            references, oof_dir, methods, aspect, fine_cands, desc=f"{aspect} refine", position=position, requested_device=requested_device
         )
         best = best_candidate(fine_cands, fine_accs)
     else:
-        candidates = simplex_grid(METHODS, step)
+        candidates = simplex_grid(methods, step)
         accs = _eval_grid(
-            references, oof_dir, aspect, candidates, desc=f"{aspect} fusion", position=position, requested_device=requested_device
+            references, oof_dir, methods, aspect, candidates, desc=f"{aspect} fusion", position=position, requested_device=requested_device
         )
         best = best_candidate(candidates, accs)
 
@@ -658,6 +778,7 @@ def search_aspect(
 
 def search_aspect_worker(
     oof_dir: Path,
+    methods: Sequence[str],
     aspect: str,
     folds: List[int],
     step: float,
@@ -666,7 +787,7 @@ def search_aspect_worker(
     requested_device: str,
 ) -> tuple[str, dict]:
     parents = parse_go_obo(obo_path)
-    return aspect, search_aspect(oof_dir, aspect, folds, step, parents, position=position, requested_device=requested_device)
+    return aspect, search_aspect(oof_dir, methods, aspect, folds, step, parents, position=position, requested_device=requested_device)
 
 
 def resolve_jobs(requested_jobs: int, aspect_count: int, requested_device: str) -> int:
@@ -682,17 +803,36 @@ def resolve_jobs(requested_jobs: int, aspect_count: int, requested_device: str) 
     return max(1, min(aspect_count, cpu_count))
 
 
+def resolve_methods_by_aspect(args: argparse.Namespace) -> Dict[str, List[str]]:
+    return {
+        aspect: discover_methods(args.oof_dir, aspect, args.fold)
+        for aspect in args.aspect
+    }
+
+
 def run_aspects_parallel(args: argparse.Namespace, jobs: int) -> Dict[str, dict]:
     executor_cls = ProcessPoolExecutor
     results: Dict[str, dict] = {}
+    methods_by_aspect = resolve_methods_by_aspect(args)
 
     def collect_results(executor) -> None:
         futures = {
-            executor.submit(search_aspect_worker, args.oof_dir, aspect, args.fold, args.step, args.obo, index, args.device): aspect
+            executor.submit(
+                search_aspect_worker,
+                args.oof_dir,
+                methods_by_aspect[aspect],
+                aspect,
+                args.fold,
+                args.step,
+                args.obo,
+                index,
+                args.device,
+            ): aspect
             for index, aspect in enumerate(args.aspect)
         }
         for future in as_completed(futures):
             aspect, best = future.result()
+            best["methods"] = methods_by_aspect[aspect]
             results[aspect] = best
 
     try:
@@ -708,11 +848,21 @@ def run_aspects_parallel(args: argparse.Namespace, jobs: int) -> Dict[str, dict]
 
 def run_aspects_sequential(args: argparse.Namespace) -> Dict[str, dict]:
     parents = parse_go_obo(args.obo)
+    methods_by_aspect = resolve_methods_by_aspect(args)
     results = {}
     for index, aspect in enumerate(args.aspect):
-        results[aspect] = search_aspect(
-            args.oof_dir, aspect, args.fold, args.step, parents, position=index, requested_device=args.device
+        best = search_aspect(
+            args.oof_dir,
+            methods_by_aspect[aspect],
+            aspect,
+            args.fold,
+            args.step,
+            parents,
+            position=index,
+            requested_device=args.device,
         )
+        best["methods"] = methods_by_aspect[aspect]
+        results[aspect] = best
     return results
 
 
@@ -721,20 +871,24 @@ def build_output(args: argparse.Namespace, results: Dict[str, dict]) -> tuple[Li
     summary = {}
     for aspect in args.aspect:
         best = results[aspect]
+        methods = best["methods"]
         weights = best["weights"]
         metrics = best["metrics"]
         row = {"aspect": aspect, "thr": round(metrics["fmax_threshold"], 2)}
-        for method in METHODS:
-            row[f"w_{METHOD_COLUMNS[method]}"] = round(weights[method], 2)
-        for method in METHODS:
-            row[f"fold_{METHOD_COLUMNS[method]}"] = best_fold(args.oof_dir, method, aspect, args.fold)
+        for method in methods:
+            row[f"w_{method_column(method)}"] = round(weights[method], 2)
+        for method in methods:
+            row[f"fold_{method_column(method)}"] = best_fold(args.oof_dir, method, aspect, args.fold)
         rows.append(row)
         summary[aspect] = {
             "weights": weights,
             "metrics": metrics,
-            "folds": {method: row[f"fold_{METHOD_COLUMNS[method]}"] for method in METHODS},
+            "folds": {method: row[f"fold_{method_column(method)}"] for method in methods},
         }
-        print(f"aspect={aspect} best_weights={weights} fmax={metrics['fmax']:.4f} threshold={metrics['fmax_threshold']:.2f}")
+        print(
+            f"aspect={aspect} fused_oof={methods} best_weights={weights} "
+            f"fmax={metrics['fmax']:.4f} threshold={metrics['fmax_threshold']:.2f}"
+        )
     return rows, summary
 
 
