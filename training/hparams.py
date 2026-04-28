@@ -33,12 +33,12 @@ COMMON_TRAINING_CONFIG: Dict[str, object] = {
 }
 
 TRAINING_RUNS: List[Dict[str, object]] = [
-    # --- ESM2 V2 tuned ---
-    {
+    # --- ESM2 (best, V3 5-fold) ---
+    {  # 5f: fmax=0.3968  aupr=0.2472  smin=93.76
         "method": "esm2-28",
         "aspect": "P",
         "epochs": 24,
-        "min_count": 30,
+        "min_count": 20,
         "lr": 3e-4,
         "weight_decay": 2e-4,
         "hidden_dim": 2048,
@@ -47,7 +47,7 @@ TRAINING_RUNS: List[Dict[str, object]] = [
         "pooling": "mean",
         "use_crafted_features": False,
     },
-    {
+    {  # 5f: fmax=0.6728  aupr=0.4723  smin=16.14
         "method": "esm2-28",
         "aspect": "F",
         "epochs": 24,
@@ -60,7 +60,7 @@ TRAINING_RUNS: List[Dict[str, object]] = [
         "pooling": "mean",
         "use_crafted_features": False,
     },
-    {
+    {  # 5f: fmax=0.6932  aupr=0.5742  smin=17.52
         "method": "esm2-33",
         "aspect": "C",
         "epochs": 18,

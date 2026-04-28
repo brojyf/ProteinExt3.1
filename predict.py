@@ -20,6 +20,7 @@ from tqdm.auto import tqdm
 from submethods import EMBEDDING_DIMS, build_model
 from submethods.bp_blast_transfer import _build_database, _parse_blast_hits, _require_blast, _run_blast, _transfer_scores
 from training.data.data_utils import (
+    DEFAULT_PROTT5_LAYER,
     MultiEmbeddingDataset,
     build_sequence_protein_features,
     collate_multi_embedding_batch,
@@ -81,8 +82,9 @@ def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device:
         for pooling_name in pooling_names
         for layer in esm2_layers
     }
+    t5_layer = int(DEFAULT_PROTT5_LAYER)
     t5_indices = {
-        pooling_name: load_shard_index(PREDICT_EMBEDDING_DIR / "prott5" / pooling_name / "0")
+        pooling_name: load_shard_index(PREDICT_EMBEDDING_DIR / "prott5" / pooling_name / str(t5_layer))
         for pooling_name in pooling_names
     } if needs_t5 else {}
     missing_esm2 = [
@@ -96,7 +98,7 @@ def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device:
     missing_t5 = [
         pid for pid in sequences_by_pid
         if any(
-            not pooled_embedding_exists(PREDICT_EMBEDDING_DIR, "prott5", pooling_name, 0, pid, t5_indices[pooling_name])
+            not pooled_embedding_exists(PREDICT_EMBEDDING_DIR, "prott5", pooling_name, t5_layer, pid, t5_indices[pooling_name])
             for pooling_name in pooling_names
         )
     ] if needs_t5 else []
@@ -121,7 +123,7 @@ def ensure_embeddings(sequences_by_pid: Dict[str, str], batch_size: int, device:
             batch_size=batch_size,
             max_length=DEFAULT_MAX_LENGTH,
             device=device,
-            layer_indices=[0],
+            layer_indices=[t5_layer],
         )
 
 

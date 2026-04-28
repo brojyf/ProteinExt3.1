@@ -138,7 +138,19 @@ Optional:
 - `--no-threshold`: disable fusion threshold filtering; default threshold enabled
 
 ## Comparison
-Run following commands 
+```bash
+python comparison/compare.py
+```
 
 
 ## Exploration
+```bash
+# Find best layer
+python exploration/layers/best_layer.py
+
+# Find best pooling
+python exploration/pooling/best_pooling.py
+
+# Validate handcrafted features
+python exploration/hand_crafted/crafted.py
+```
